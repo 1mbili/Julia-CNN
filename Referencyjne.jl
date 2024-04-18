@@ -9,13 +9,9 @@ function loader(data; batchsize::Int=1)
 end
 
 net = Chain(
-    Conv((3, 3), 1 => 6,  relu),
-    MaxPool((2, 2)),
-    Conv((3, 3), 6 => 16, relu),
-    MaxPool((2, 2)),
     Flux.flatten,
-    Dense(400 => 84, relu), 
-    Dense(84 => 10, identity),
+    Dense(784 => 25, relu), 
+    Dense(25 => 10, identity),
 )
      
 Chain(
@@ -48,7 +44,7 @@ train_log = []
 settings = (;
     eta = 1e-2,
     epochs = 3,
-    batchsize = 100,
+    batchsize = 1,
 )
 
 opt_state = Flux.setup(Descent(settings.eta), net);
