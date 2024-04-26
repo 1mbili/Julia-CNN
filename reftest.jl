@@ -31,8 +31,9 @@ y1hat = net(x1)
 using Statistics: mean  # standard library
 function loss_and_accuracy(model, data)
     (x,y) = only(loader(data; batchsize=length(data)))
-    println(size(x), size(y))
     ŷ = model(x)
+    println(size(ŷ))
+    a = 1314321
     loss = Flux.logitcrossentropy(ŷ, y)  # did not include softmax in the model
     println("LOSS: ", loss)
     acc = round(100 * mean(Flux.onecold(ŷ) .== Flux.onecold(y)); digits=2)
@@ -48,16 +49,16 @@ settings = (;
     batchsize = 100,
 )
 
-opt_state = Flux.setup(Descent(settings.eta), net);
-for epoch in 1:settings.epochs
-    @time for (x,y) in loader(train_data, batchsize=settings.batchsize)
-        grads = Flux.gradient(model -> Flux.logitcrossentropy(model(x), y), net)
-        Flux.update!(opt_state, net, grads[1])
-    end
+# opt_state = Flux.setup(Descent(settings.eta), net);
+# for epoch in 1:settings.epochs
+#     @time for (x,y) in loader(train_data, batchsize=settings.batchsize)
+#         # grads = Flux.gradient(model -> Flux.logitcrossentropy(model(x), y), net)
+#         # Flux.update!(opt_state, net, grads[1])
+#     end
     
-    loss, acc, _ = loss_and_accuracy(net, train_data)
-    test_loss, test_acc, _ = loss_and_accuracy(net, test_data)
-    @info epoch acc test_acc
-    nt = (; epoch, loss, acc, test_loss, test_acc) 
-    push!(train_log, nt)
-end
+#     # loss, acc, _ = loss_and_accuracy(net, train_data)
+#     # test_loss, test_acc, _ = loss_and_accuracy(net, test_data)
+#     # @info epoch acc test_acc
+#     # nt = (; epoch, loss, acc, test_loss, test_acc) 
+#     # push!(train_log, nt)
+# end

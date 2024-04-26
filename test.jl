@@ -1,22 +1,23 @@
 using MLDatasets, Flux, Statistics
 using LinearAlgebra
+using Random
+Random.seed!(1234);
 
 train_data = MLDatasets.MNIST(split=:train)
 test_data  = MLDatasets.MNIST(split=:test)
 
 
-function loader(data)
-    dim1, dim2, dim3 = size(data.features)
-    x = reshape(data.features, dim1 * dim2, dim3)
-    y = data.targets
-    #x4dim = reshape(data.features, 28, 28, 1, :) # insert trivial channel dim
-    yhot  = Flux.onehotbatch(data.targets, 0:9)  # make a 10×60000 OneHotMatrix
-    return x, y, yhot
-    #Flux.DataLoader((x4dim, yhot); batchsize, shuffle=true)
+function onehotbatch(y::Vector{Int64}, c::Integer)
+    out = zeros(c, length(y))
+    for (index, val) in enumerate(y)
+        @inbounds out[val+1, index] = 1.0
+    end
+    return out
 end
 
 x1 = train_data.features
-yhot = Flux.onehotbatch(train_data.targets, 0:9)
+yhot = onehotbatch(train_data.targets, 10)
+
 
 
 abstract type GraphNode end
@@ -26,11 +27,14 @@ struct Constant{T} <: GraphNode
     output :: T
 end
 
-mutable struct Variable <: GraphNode
-    output :: Any
-    gradient :: Any
+mutable struct Variable{T,N} <: GraphNode where {T<:Real, N<:Integer}
+    output :: Array{T,N}
+    gradient :: Array{T,N}
+    cache :: Array{T,N}
     name :: String
-    Variable(output; name="?") = new(output, nothing, name)
+    function Variable(output::Array{T,N}; name::String="?") where {T<:Real, N<:Integer}
+        new{T,N}(output, similar(output), zero(output), name)
+    end
 end
 
 mutable struct ScalarOperator{F} <: Operator
@@ -48,6 +52,8 @@ mutable struct BroadcastedOperator{F} <: Operator
     name :: String
     BroadcastedOperator(fun, inputs...; name="?") = new{typeof(fun)}(inputs, nothing, nothing, name)
 end
+
+
 import Base: show, summary
 show(io::IO, x::ScalarOperator{F}) where {F} = print(io, "op ", x.name, "(", F, ")");
 show(io::IO, x::BroadcastedOperator{F}) where {F} = print(io, "op.", x.name, "(", F, ")");
@@ -254,7 +260,7 @@ end
 relu(x::Real) = max(zero(x), x)
 relu(x::GraphNode) = BroadcastedOperator(relu, x)
 forward(::BroadcastedOperator{typeof(relu)}, x) = return max.(zero(x), x)
-backward(::BroadcastedOperator{typeof(relu)}, x, g) = tuple(g .* isless.(x, 0))
+backward(::BroadcastedOperator{typeof(relu)}, x, g) = tuple(g .* (x .> 0))
 
 
 import Base: identity
@@ -279,23 +285,20 @@ backward(::BroadcastedOperator{typeof(reshape)}, x, ndims, g) =
     tuple(reshape(g, size(x)))
 
 
-function flatten(x) return reshape(x, length(x)) end
-
-
-poprawne = 0
-suma2 = 0
+# poprawne = 0
+# suma = 0
 logit_cross_entropy(y_predicted::GraphNode, y::GraphNode) = BroadcastedOperator(logit_cross_entropy, y_predicted, y)
 forward(::BroadcastedOperator{typeof(logit_cross_entropy)}, y_predicted, y) =
 let
-    global suma2 += 1
-    if argmax(y_predicted) == argmax(y)
-        global poprawne += 1
-    end
-    #println("Accuracy: ", poprawne/suma2)
+    # global suma += 1
+    # if argmax(y_predicted) == argmax(y)
+    #     global poprawne += 1
+    # end
+    #println("Accuracy: ", poprawne/suma)
     y_shifted = y_predicted .- maximum(y_predicted)
     shifted_logsumexp = log.(sum(exp.(y_shifted)))
     result = y_shifted .- shifted_logsumexp
-    loss = -1 .* mean(y .* result)
+    loss = -1 .* sum(y .* result)
     return loss
 end
 backward(::BroadcastedOperator{typeof(logit_cross_entropy)}, y_predicted, y, g) =
@@ -306,12 +309,10 @@ let
     return tuple(g .* result)
 end
 
-
 function dense(w, b, x, activation) 
     return activation((w * x) .+ b) 
 end
 function dense(w, x, activation) return activation(w * x) end
-function dense(w, x) return w * x end
 
 
 function flatten(x) return reshape(x, length(x)) end
@@ -319,15 +320,59 @@ flatten(x::GraphNode) = BroadcastedOperator(flatten, x)
 forward(::BroadcastedOperator{typeof(flatten)}, x) = reshape(x, length(x))
 backward(::BroadcastedOperator{typeof(flatten)}, x, g) = tuple(reshape(g, size(x)))
 
-function conv2d() end
-
-
-function mean_squared_loss(y, ŷ)
-    return sum(Constant(0.5) .* (y .- ŷ) .^ Constant(2))
+function maxPool(x, kernel_size)
+    N, C, H, W = size(x)
+    K_H = kernel_size[1]
+    K_W = kernel_size[2]
+    W_2 = fld(W - K_W, K_W) + 1
+    H_2 = fld(H - K_H ,K_H) + 1
+    if H_2 % 2 == 1
+        H -= 1
+        W -= 1
+    end
+    out = zeros(N, C, H_2, W_2)
+    for n=1:N
+        for c=1:C
+            for h=1:K_H:H
+                for w=1:K_W:W
+                    out[n, c, Int.((w+1)/K_W), Int.((h+1)/K_H)] = maximum(x[n, c, h:h+K_H-1,w:w+K_W-1])
+                end
+            end
+        end
+    end
+    return out
 end
 
 
+function maxPoolB(x, g, kernel_size)
+    N, C, H, W = size(x)
+    Gn, Gc, Gh, Gw = size(g)
+    dx = zeros(N, C, H, W)
+    K_H = kernel_size[1]
+    K_W = kernel_size[2]
+    for n=1:Gn
+        for c=1:Gc
+            for h=1:Gh
+                for w=1:Gw
+                    max_val = x[n, c, 1+(h-1)*K_H:h*(K_H), 1+(w-1)*K_W:w*K_W]
+                    max_h, max_w = Tuple.(findmax(max_val)[2])
+                    max_h += (h-1)*K_H
+                    max_w += (w-1)*K_W
+                    dx[n,c,max_h,max_w] = g[n,c,h,w]
+                end
+            end
+        end
+    end
+    return tuple(dx)
+end
+
+maxPool(x::GraphNode, kernel_size:: Any) = BroadcastedOperator(maxPool, x, kernel_size)
+forward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size) = maxPool(x, kernel_size)
+backward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size, g) = maxPoolB(x, g, kernel_size)
+
+
 abstract type NetworkLayer end
+
 
 mutable struct Network
     layers
@@ -340,7 +385,6 @@ end
 function conv(I, K, b)
     N, C, H, W = size(I)
     F, C, HH, WW = size(K)
-    P = 0
     H_R = 1 + H - HH
     W_R = 1 + W - WW
     out = zeros(N, F, H_R, W_R)
@@ -369,56 +413,44 @@ backward(::BroadcastedOperator{typeof(conv)}, x, w, b, g) = let
         for depth=1:F
             for r=1:H_R
                 for c=1:W_R
-                    window = x[n, :, r:r+HH-1, c:c+WW-1]
-                    db[depth] += g[n, depth, r, c]
-                    dw[depth, :, :, :] += window .* g[n, depth, r, c]
-                    dx[n, :, r:r+HH-1, c:c+WW-1] += w[depth, :, :, :] .* g[n, depth, r, c]
+                    wu = w[depth, :, :, :]
+                    gje = g[n, depth, r, c]
+                    dx[n, :, r:r+HH-1, c:c+WW-1] += wu .* gje
+                    dw[depth, :, :, :] += x[n, :, r:r+HH-1, c:c+WW-1] .* g[n, depth, r, c]
                 end
             end
         end
     end
+    for depth=1:F
+        db[depth] = sum(g[:, depth, :, :])
+    end
     return tuple(dx, dw, db)
-                    #dx[n, :, r:r+HH-1, c:c+WW-1] += w[depth, :, :, :] .* g[n, depth, r, c]
-                    
-    #             end
-    #         end
-    #     end
-    # end
-    # for n=1:N
-    #     for depth=1:F
-    #         for r=1:H_R
-    #             for c=1:W_R
-    #                 dw[depth, :, :, :] += x[n, :, r:r+HH-1, c:c+WW-1] .* g[n, depth, r, c]
-    #             end
-    #         end
-    #     end
-    # end
-    # for depth=1:F
-    #     db[depth] = sum(g[:, depth, :, :])
-    # end
-    # return tuple(dx, dw, db)
 end
 
-# kernel = [1 0 -1; 2 0 -2; 1 0 -1]
-# I = randn(1, 1, 28, 28)
-# k = randn(5, 1, 3, 3)
-# a = conv(I, k, randn(6))
-# println(size(a))
 function create_kernels(n_input, n_output, kernel_width, kernel_height)
-    random_vals = randn(n_output, n_input, kernel_width, kernel_height) / 100
+    # Inicjalizacja Xaviera
+    squid = sqrt(6 / (n_input + n_output * (kernel_width * kernel_height)))
+    random_vals = randn(n_output, n_input, kernel_width, kernel_height) * squid
     return Variable(random_vals)
 end
 
+function xavier_init(n_input, n_output)
+    return Variable(randn(n_input, n_output) * sqrt(6 / (n_input + n_output)))
+end
 
 
 mutable struct aDense <: NetworkLayer
-    num_inputs :: Integer
-    num_outputs :: Integer
-    weights :: Any
-    bias :: Any
+    weights :: Variable
+    bias :: Variable
     activation :: Function
     func :: Function
-    aDense(pair, activation) = new(pair[2], pair[1], Variable(randn(pair[2], pair[1])/10), Variable(randn(pair[2])), activation, dense)
+    aDense(pair, activation) = new(xavier_init(pair[2], pair[1]), Variable(zeros(pair[2])), activation, dense)
+end
+
+mutable struct aMaxPool <: NetworkLayer
+    kernel_size :: Constant
+    func :: Function
+    aMaxPool(kernel_size) = new(Constant(kernel_size), maxPool)
 end
 
 mutable struct aFlatten <: NetworkLayer
@@ -427,23 +459,22 @@ mutable struct aFlatten <: NetworkLayer
 end
 
 mutable struct aConv2d <: NetworkLayer
-    kernel :: Any
-    bias :: Any
+    weights :: Variable
+    bias :: Variable
     activation :: Function
-    stride :: Any
-    padding :: Any
     func :: Function
 end
-aConv(filter_size, pair, activation) = aConv2d(create_kernels(pair[1], pair[2], filter_size[1], filter_size[2]), Variable(zeros(pair[2])), activation, nothing, nothing, conv)
-aConv(filter_size, pair, activation, stride) = aConv2d(create_kernels(pair[1], pair[2], filter_size[1], filter_size[2]), Variable(zeros(pair[2])), activation, stride, nothing, conv)
-aConv(filter_size, pair, activation, stride, padding) = aConv2d(create_kernels(pair[1], pair[2], filter_size[1], filter_size[2]), Variable(zeros(pair[2])), activation, stride, padding, conv)
+aConv(filter_size, pair, activation) = aConv2d(create_kernels(pair[1], pair[2], filter_size[1], filter_size[2]), Variable(zeros(pair[2])), activation, conv)
 
 
 net = Network(
-    #aConv((3, 3), 1 => 6, relu),
+    aConv((3, 3), 1 => 6, relu),
+    aMaxPool((2,2)),
+    aConv((3, 3), 6 => 16, relu),
+    aMaxPool((2,2)),
     aFlatten(),
-    aDense(784 => 25, relu),
-    aDense(25 => 10, identity)
+    aDense(400 => 84, relu),
+    aDense(84 => 10, identity)
 )
 
 (n::Network)(x) = begin
@@ -451,8 +482,26 @@ net = Network(
         if layer.func == dense
             x = layer.func(layer.weights, layer.bias, x, layer.activation)
         elseif layer.func == conv
-            x = layer.func(x, layer.kernel, layer.bias)
+            x = layer.func(x, layer.weights, layer.bias)
             x = layer.activation(x)
+        elseif layer.func == maxPool
+             x = layer.func(x, layer.kernel_size)
+        else
+            x = layer.func(x)
+        end
+    end
+    return argmax(forward!(topological_sort(x)))
+end
+
+create_graph(n::Network, x) = begin
+    for layer in n.layers
+        if layer.func == dense
+            x = layer.func(layer.weights, layer.bias, x, layer.activation)
+        elseif layer.func == conv
+            x = layer.func(x, layer.weights, layer.bias)
+            x = layer.activation(x)
+        elseif layer.func == maxPool
+             x = layer.func(x, layer.kernel_size)
         else
             x = layer.func(x)
         end
@@ -465,40 +514,64 @@ agrad(loss_func, y_predicted, y_true) = begin
     order = topological_sort(loss)
     return order
 end
-#backward!(order)
-#return [layer.weights.gradient for layer in network.layers]
-# x = Variable([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.011764706, 0.07058824, 0.07058824, 0.07058824, 0.49411765, 0.53333336, 0.6862745, 0.101960786, 0.6509804, 1.0, 0.96862745, 0.49803922, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.11764706, 0.14117648, 0.36862746, 0.6039216, 0.6666667, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.88235295, 0.6745098, 0.99215686, 0.9490196, 0.7647059, 0.2509804, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.19215687, 0.93333334, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.9843137, 0.3647059, 0.32156864, 0.32156864, 0.21960784, 0.15294118, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.07058824, 0.85882354, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.7764706, 0.7137255, 0.96862745, 0.94509804, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3137255, 0.6117647, 0.41960785, 0.99215686, 0.99215686, 0.8039216, 0.043137256, 0.0, 0.16862746, 0.6039216, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05490196, 0.003921569, 0.6039216, 0.99215686, 0.3529412, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.54509807, 0.99215686, 0.74509805, 0.007843138, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.043137256, 0.74509805, 0.99215686, 0.27450982, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.13725491, 0.94509804, 0.88235295, 0.627451, 0.42352942, 0.003921569, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.31764707, 0.9411765, 0.99215686, 0.99215686, 0.46666667, 0.09803922, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1764706, 0.7294118, 0.99215686, 0.99215686, 0.5882353, 0.105882354, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0627451, 0.3647059, 0.9882353, 0.99215686, 0.73333335, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9764706, 0.99215686, 0.9764706, 0.2509804, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.18039216, 0.50980395, 0.7176471, 0.99215686, 0.99215686, 0.8117647, 0.007843138, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.15294118, 0.5803922, 0.8980392, 0.99215686, 0.99215686, 0.99215686, 0.98039216, 0.7137255, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.09411765, 0.44705883, 0.8666667, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.7882353, 0.30588236, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.09019608, 0.25882354, 0.8352941, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.7764706, 0.31764707, 0.007843138, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.07058824, 0.67058825, 0.85882354, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.7647059, 0.3137255, 0.03529412, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.21568628, 0.6745098, 0.8862745, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.95686275, 0.52156866, 0.043137256, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.53333336, 0.99215686, 0.99215686, 0.99215686, 0.83137256, 0.5294118, 0.5176471, 0.0627451, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], name="x")
-# result = net(x)
-# println(result)
-# y = Variable([0, 0, 0, 0, 0, 1, 0, 0, 0, 0], name="y")
-# agrad(logit_cross_entropy, result, y)
-for i=1:60000
-#     #x = Variable([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.011764706, 0.07058824, 0.07058824, 0.07058824, 0.49411765, 0.53333336, 0.6862745, 0.101960786, 0.6509804, 1.0, 0.96862745, 0.49803922, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.11764706, 0.14117648, 0.36862746, 0.6039216, 0.6666667, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.88235295, 0.6745098, 0.99215686, 0.9490196, 0.7647059, 0.2509804, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.19215687, 0.93333334, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.9843137, 0.3647059, 0.32156864, 0.32156864, 0.21960784, 0.15294118, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.07058824, 0.85882354, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.7764706, 0.7137255, 0.96862745, 0.94509804, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3137255, 0.6117647, 0.41960785, 0.99215686, 0.99215686, 0.8039216, 0.043137256, 0.0, 0.16862746, 0.6039216, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05490196, 0.003921569, 0.6039216, 0.99215686, 0.3529412, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.54509807, 0.99215686, 0.74509805, 0.007843138, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.043137256, 0.74509805, 0.99215686, 0.27450982, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.13725491, 0.94509804, 0.88235295, 0.627451, 0.42352942, 0.003921569, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.31764707, 0.9411765, 0.99215686, 0.99215686, 0.46666667, 0.09803922, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1764706, 0.7294118, 0.99215686, 0.99215686, 0.5882353, 0.105882354, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0627451, 0.3647059, 0.9882353, 0.99215686, 0.73333335, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9764706, 0.99215686, 0.9764706, 0.2509804, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.18039216, 0.50980395, 0.7176471, 0.99215686, 0.99215686, 0.8117647, 0.007843138, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.15294118, 0.5803922, 0.8980392, 0.99215686, 0.99215686, 0.99215686, 0.98039216, 0.7137255, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.09411765, 0.44705883, 0.8666667, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.7882353, 0.30588236, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.09019608, 0.25882354, 0.8352941, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.7764706, 0.31764707, 0.007843138, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.07058824, 0.67058825, 0.85882354, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.7647059, 0.3137255, 0.03529412, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.21568628, 0.6745098, 0.8862745, 0.99215686, 0.99215686, 0.99215686, 0.99215686, 0.95686275, 0.52156866, 0.043137256, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.53333336, 0.99215686, 0.99215686, 0.99215686, 0.83137256, 0.5294118, 0.5176471, 0.0627451, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], name="x")
-    #x = Variable([0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.21568628 0.53333336 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.6745098 0.99215686 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.07058824 0.8862745 0.99215686 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.19215687 0.07058824 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.67058825 0.99215686 0.99215686 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.11764706 0.93333334 0.85882354 0.3137255 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.09019608 0.85882354 0.99215686 0.83137256 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.14117648 0.99215686 0.99215686 0.6117647 0.05490196 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.25882354 0.99215686 0.99215686 0.5294118 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.36862746 0.99215686 0.99215686 0.41960785 0.003921569 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.09411765 0.8352941 0.99215686 0.99215686 0.5176471 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.6039216 0.99215686 0.99215686 0.99215686 0.6039216 0.54509807 0.043137256 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.44705883 0.99215686 0.99215686 0.95686275 0.0627451 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.011764706 0.6666667 0.99215686 0.99215686 0.99215686 0.99215686 0.99215686 0.74509805 0.13725491 0.0 0.0 0.0 0.0 0.0 0.15294118 0.8666667 0.99215686 0.99215686 0.52156866 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.07058824 0.99215686 0.99215686 0.99215686 0.8039216 0.3529412 0.74509805 0.99215686 0.94509804 0.31764707 0.0 0.0 0.0 0.0 0.5803922 0.99215686 0.99215686 0.7647059 0.043137256 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.07058824 0.99215686 0.99215686 0.7764706 0.043137256 0.0 0.007843138 0.27450982 0.88235295 0.9411765 0.1764706 0.0 0.0 0.18039216 0.8980392 0.99215686 0.99215686 0.3137255 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.07058824 0.99215686 0.99215686 0.7137255 0.0 0.0 0.0 0.0 0.627451 0.99215686 0.7294118 0.0627451 0.0 0.50980395 0.99215686 0.99215686 0.7764706 0.03529412 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.49411765 0.99215686 0.99215686 0.96862745 0.16862746 0.0 0.0 0.0 0.42352942 0.99215686 0.99215686 0.3647059 0.0 0.7176471 0.99215686 0.99215686 0.31764707 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.53333336 0.99215686 0.9843137 0.94509804 0.6039216 0.0 0.0 0.0 0.003921569 0.46666667 0.99215686 0.9882353 0.9764706 0.99215686 0.99215686 0.7882353 0.007843138 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.6862745 0.88235295 0.3647059 0.0 0.0 0.0 0.0 0.0 0.0 0.09803922 0.5882353 0.99215686 0.99215686 0.99215686 0.98039216 0.30588236 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.101960786 0.6745098 0.32156864 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.105882354 0.73333335 0.9764706 0.8117647 0.7137255 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.6509804 0.99215686 0.32156864 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.2509804 0.007843138 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 1.0 0.9490196 0.21960784 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.96862745 0.7647059 0.15294118 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.49803922 0.2509804 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0])
-    #y = Variable([0, 0, 0, 0, 0, 1, 0, 0, 0, 0], name="y")
-    x = Variable(x1[:, :, i], name="x")
-    y = Variable(yhot[:, i], name="y")
-    x.output = reshape(x.output, 1, 1, 28, 28)
-    graph = net(x)
-    order = agrad(logit_cross_entropy, graph, y)
-    loss = forward!(order)
-    if i % 1000 == 0
-        println("Loss: ", loss)
-        println("Accuracy: ", poprawne/suma2)
+
+function update_weights!(n::Network, batchsize)
+    for layer in n.layers
+        if layer.func == dense
+            layer.weights.output .-= layer.weights.cache / batchsize
+            layer.bias.output .-= layer.bias.cache / batchsize
+            layer.bias.cache .= 0
+            layer.weights.cache .= 0
+        elseif layer.func == conv
+            layer.weights.output .-= layer.weights.cache / batchsize
+            layer.bias.output .-= layer.bias.cache / batchsize
+            layer.bias.cache .= 0
+            layer.weights.cache .= 0
+        end
     end
+end
+
+function update_cache!(n::Network, order, learning_rate)
     backward!(order)
-    for layer in net.layers
-      if hasproperty(layer, :weights)
-          layer.weights.output -= 0.01 .* layer.weights.gradient
-          layer.bias.output -= 0.01 .* layer.bias.gradient
-          #layer.weights.gradient .= 0
-          #layer.bias.gradient .= 0
-      elseif hasproperty(layer, :kernel)
-          layer.kernel.output -= 0.01 .* layer.kernel.gradient
-          layer.bias.output -= 0.01 .* layer.bias.gradient
-          layer.kernel.gradient .= 0
-          layer.bias.gradient .= 0
-        
-      end
+    for layer in n.layers
+        if layer.func == dense
+            layer.weights.cache .+= learning_rate .* layer.weights.gradient
+            layer.bias.cache .+= learning_rate .* layer.bias.gradient
+        elseif layer.func == conv
+            layer.weights.cache .+= learning_rate .* layer.weights.gradient
+            layer.bias.cache .+= learning_rate .* layer.bias.gradient
+        end
     end
+end
+
+settings = (;
+    eta = 1e-2,
+    epochs = 3,
+    batchsize = 10,
+)
+
+# function loss_and_accuracy(model, data)
+#     x_e = data.features
+#     yhot_e = Flux.onehotbatch(data.targets, 0:9)
+#     size = length(data)
+#     suma = size
+#     poprawne = 0
+#     for i=1:size
+#         x = Variable(reshape(x_e[:, :, i], 1, 1, 28, 28), name="x") 
+#         y = yhot_e[:, i]
+#         result = model(x)
+#         if result == argmax(y)
+#             poprawne += 1
+#         end
+#     end
+#     acc = round(100 * poprawne/suma; digits=2)
+#     return acc
+# end
+
+# @show loss_and_accuracy(net, test_data);  # accuracy about 10%, before training
+
+#using BenchmarkTools
+@time for i=1:60000
+    x = Variable(reshape(x1[:, :, i], 1, 1, 28, 28), name="x")
+    y1 = Variable(yhot[:, i], name="y")
 end

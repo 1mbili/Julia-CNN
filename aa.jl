@@ -7,14 +7,6 @@ train_data = MLDatasets.MNIST(split=:train)
 test_data  = MLDatasets.MNIST(split=:test)
 
 
-# function loader(data; batchsize::Int=1)
-#     x4dim = reshape(data.features, 28, 28, 1, :) # insert trivial channel dim
-#     yhot  = Flux.onehotbatch(data.targets, 0:9)  # make a 10×60000 OneHotMatrix
-#     Flux.DataLoader((x4dim, yhot); batchsize, shuffle=true)
-# end
-
-
-dim1, dim2, dim3 = size(train_data.features)
 x1 = train_data.features
 yhot = Flux.onehotbatch(train_data.targets, 0:9)
 
@@ -28,8 +20,9 @@ end
 mutable struct Variable <: GraphNode
     output :: Any
     gradient :: Any
+    cache :: Any
     name :: String
-    Variable(output; name="?") = new(output, nothing, name)
+    Variable(output; name="?") = new(output, nothing, zero(copy(output)), name)
 end
 
 mutable struct ScalarOperator{F} <: Operator
@@ -278,16 +271,16 @@ backward(::BroadcastedOperator{typeof(reshape)}, x, ndims, g) =
     tuple(reshape(g, size(x)))
 
 
-poprawne = 0
-suma2 = 0
+# poprawne = 0
+# suma = 0
 logit_cross_entropy(y_predicted::GraphNode, y::GraphNode) = BroadcastedOperator(logit_cross_entropy, y_predicted, y)
 forward(::BroadcastedOperator{typeof(logit_cross_entropy)}, y_predicted, y) =
 let
-    global suma2 += 1
-    if argmax(y_predicted) == argmax(y)
-        global poprawne += 1
-    end
-    println("Accuracy: ", poprawne/suma2)
+    # global suma += 1
+    # if argmax(y_predicted) == argmax(y)
+    #     global poprawne += 1
+    # end
+    #println("Accuracy: ", poprawne/suma)
     y_shifted = y_predicted .- maximum(y_predicted)
     shifted_logsumexp = log.(sum(exp.(y_shifted)))
     result = y_shifted .- shifted_logsumexp
@@ -302,14 +295,10 @@ let
     return tuple(g .* result)
 end
 
-
-losses = Float64[]
-
 function dense(w, b, x, activation) 
     return activation((w * x) .+ b) 
 end
 function dense(w, x, activation) return activation(w * x) end
-#function dense(w, x) return w * x end
 
 
 function flatten(x) return reshape(x, length(x)) end
@@ -317,22 +306,21 @@ flatten(x::GraphNode) = BroadcastedOperator(flatten, x)
 forward(::BroadcastedOperator{typeof(flatten)}, x) = reshape(x, length(x))
 backward(::BroadcastedOperator{typeof(flatten)}, x, g) = tuple(reshape(g, size(x)))
 
-function maxPool(x, kernel_size)
+function maxPool(x, kernel_size, cache)
     N, C, H, W = size(x)
     K_H = kernel_size[1]
     K_W = kernel_size[2]
     W_2 = fld(W - K_W, K_W) + 1
     H_2 = fld(H - K_H ,K_H) + 1
-    if H_2 % 2 == 1
-        H -= 1
-        W -= 1
-    end
     out = zeros(N, C, H_2, W_2)
     for n=1:N
         for c=1:C
-            for h=1:K_H:H
-                for w=1:K_W:W
-                    out[n, c, Int.((w+1)/K_W), Int.((h+1)/K_H)] = maximum(x[n, c, h:h+K_H-1,w:w+K_W-1])
+            for h=1:H_2
+                @views for w=1:W_2
+                    val, ind = findmax(x[n, c, K_H*(h-1)+1:K_H*h, K_W*(w-1)+1:K_W*w])
+                    out[n, c, w, h] = val
+                    ix, iy = ind[1] + K_H*(h-1), ind[2] + K_W*(w-1) # +1 -1 sie skraca
+                    push!(cache, CartesianIndex(n, c, ix, iy))
                 end
             end
         end
@@ -341,31 +329,27 @@ function maxPool(x, kernel_size)
 end
 
 
-function maxPoolB(x, g, kernel_size)
-    N, C, H, W = size(x)
+function maxPoolB(x, g, kernel_size, cache)
     Gn, Gc, Gh, Gw = size(g)
-    dx = zeros(N, C, H, W)
-    K_H = kernel_size[1]
-    K_W = kernel_size[2]
+    dx1 = zeros(size(x))
+    counter = 1
     for n=1:Gn
         for c=1:Gc
             for h=1:Gh
-                for w=1:Gw
-                    max_val = x[n, c, 1+(h-1)*K_H:h*(K_H), 1+(w-1)*K_W:w*K_W]
-                    max_h, max_w = Tuple.(findmax(max_val)[2])
-                    max_h += (h-1)*K_H
-                    max_w += (w-1)*K_W
-                    dx[n,c,max_h,max_w] = g[n,c,h,w]
+                @views for w=1:Gw
+                    dx1[cache[counter]] = g[n, c, h, w]
+                    counter += 1
                 end
             end
         end
     end
+    empty!(cache)
     return tuple(dx)
 end
 
-maxPool(x::GraphNode, kernel_size:: Any) = BroadcastedOperator(maxPool, x, kernel_size)
-forward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size) = maxPool(x, kernel_size)
-backward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size, g) = maxPoolB(x, g, kernel_size)
+maxPool(x::GraphNode, kernel_size:: Any, cache ::Any) = BroadcastedOperator(maxPool, x, kernel_size, cache)
+forward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size, cache ::Any) = maxPool(x, kernel_size, cache)
+backward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size, cache ::Any, g) = maxPoolB(x, g, kernel_size, cache)
 
 
 abstract type NetworkLayer end
@@ -446,8 +430,9 @@ end
 
 mutable struct aMaxPool <: NetworkLayer
     kernel_size :: Any
+    cache :: Constant{Vector{CartesianIndex{4}}}
     func :: Function
-    aMaxPool(kernel_size) = new(Constant(kernel_size), maxPool)
+    aMaxPool(kernel_size) = new(Constant(kernel_size), Constant(CartesianIndex{4}[]), maxPool)
 end
 
 mutable struct aFlatten <: NetworkLayer
@@ -482,12 +467,12 @@ net = Network(
             x = layer.func(x, layer.weights, layer.bias)
             x = layer.activation(x)
         elseif layer.func == maxPool
-             x = layer.func(x, layer.kernel_size)
+            x = layer.func(x, layer.kernel_size, layer.cache)
         else
             x = layer.func(x)
         end
     end
-    return argmax(forward!(topological_sort(x)))-1
+    return argmax(forward!(topological_sort(x)))
 end
 
 create_graph(n::Network, x) = begin
@@ -498,7 +483,7 @@ create_graph(n::Network, x) = begin
             x = layer.func(x, layer.weights, layer.bias)
             x = layer.activation(x)
         elseif layer.func == maxPool
-             x = layer.func(x, layer.kernel_size)
+             x = layer.func(x, layer.kernel_size, layer.cache)
         else
             x = layer.func(x)
         end
@@ -512,29 +497,79 @@ agrad(loss_func, y_predicted, y_true) = begin
     return order
 end
 
-function update!(n::Network, order, learning_rate)
-    backward!(order)
+function update_weights!(n::Network, batchsize)
     for layer in n.layers
         if layer.func == dense
-            layer.weights.output .-= learning_rate .* layer.weights.gradient
-            layer.bias.output .-= learning_rate .* layer.bias.gradient
+            layer.weights.output .-= layer.weights.cache / batchsize
+            layer.bias.output .-= layer.bias.cache / batchsize
+            layer.bias.cache .= 0
+            layer.weights.cache .= 0
         elseif layer.func == conv
-            layer.weights.output .-= learning_rate .* layer.weights.gradient
-            layer.bias.output .-= learning_rate .* layer.bias.gradient
+            layer.weights.output .-= layer.weights.cache / batchsize
+            layer.bias.output .-= layer.bias.cache / batchsize
+            layer.bias.cache .= 0
+            layer.weights.cache .= 0
         end
     end
 end
 
-@time for i=1:2:1000
-    x = Variable(reshape(x1[:, :, i:i+1], 2, 1, 28, 28), name="x")
-    y1 = Variable(yhot[:, i:i+1], name="y")
-    println(x.output)
-    
-    #println(y1.output)
-    x = Variable([0.0;;; 0.0;;; 0.0;;; 20.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.011764706;;; 0.07058824;;; 0.07058824;;; 0.07058824;;; 0.49411765;;; 0.53333336;;; 0.6862745;;; 0.101960786;;; 0.6509804;;; 1.0;;; 0.96862745;;; 0.49803922;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.11764706;;; 0.14117648;;; 0.36862746;;; 0.6039216;;; 0.6666667;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.88235295;;; 0.6745098;;; 0.99215686;;; 0.9490196;;; 0.7647059;;; 0.2509804;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.19215687;;; 0.93333334;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.9843137;;; 0.3647059;;; 0.32156864;;; 0.32156864;;; 0.21960784;;; 0.15294118;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.07058824;;; 0.85882354;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.7764706;;; 0.7137255;;; 0.96862745;;; 0.94509804;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.3137255;;; 0.6117647;;; 0.41960785;;; 0.99215686;;; 0.99215686;;; 0.8039216;;; 0.043137256;;; 0.0;;; 0.16862746;;; 0.6039216;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.05490196;;; 0.003921569;;; 0.6039216;;; 0.99215686;;; 0.3529412;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.54509807;;; 0.99215686;;; 0.74509805;;; 0.007843138;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.043137256;;; 0.74509805;;; 0.99215686;;; 0.27450982;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.13725491;;; 0.94509804;;; 0.88235295;;; 0.627451;;; 0.42352942;;; 0.003921569;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.31764707;;; 0.9411765;;; 0.99215686;;; 0.99215686;;; 0.46666667;;; 0.09803922;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.1764706;;; 0.7294118;;; 0.99215686;;; 0.99215686;;; 0.5882353;;; 0.105882354;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0627451;;; 0.3647059;;; 0.9882353;;; 0.99215686;;; 0.73333335;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.9764706;;; 0.99215686;;; 0.9764706;;; 0.2509804;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.18039216;;; 0.50980395;;; 0.7176471;;; 0.99215686;;; 0.99215686;;; 0.8117647;;; 0.007843138;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.15294118;;; 0.5803922;;; 0.8980392;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.98039216;;; 0.7137255;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.09411765;;; 0.44705883;;; 0.8666667;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.7882353;;; 0.30588236;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.09019608;;; 0.25882354;;; 0.8352941;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.7764706;;; 0.31764707;;; 0.007843138;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.07058824;;; 0.67058825;;; 0.85882354;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.7647059;;; 0.3137255;;; 0.03529412;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.21568628;;; 0.6745098;;; 0.8862745;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.95686275;;; 0.52156866;;; 0.043137256;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.53333336;;; 0.99215686;;; 0.99215686;;; 0.99215686;;; 0.83137256;;; 0.5294118;;; 0.5176471;;; 0.0627451;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0;;; 0.0], name="x")
-    y1 = Variable([0, 0, 0, 0, 0, 1, 0, 0, 0, 0], name="y")
-    graph = create_graph(net, x)
-    full = agrad(logit_cross_entropy, graph, y1)
-    loss = forward!(full)
-    update!(net, full, 0.01)
+function update_cache!(n::Network, order, learning_rate)
+    backward!(order)
+    for layer in n.layers
+        if layer.func == dense
+            layer.weights.cache .+= learning_rate .* layer.weights.gradient
+            layer.bias.cache .+= learning_rate .* layer.bias.gradient
+        elseif layer.func == conv
+            layer.weights.cache .+= learning_rate .* layer.weights.gradient
+            layer.bias.cache .+= learning_rate .* layer.bias.gradient
+        end
+    end
+end
+
+settings = (;
+    eta = 1e-2,
+    epochs = 3,
+    batchsize = 1,
+)
+
+function loss_and_accuracy(model, data)
+    x_e = data.features
+    yhot_e = Flux.onehotbatch(data.targets, 0:9)
+    size = 100
+    suma = size
+    poprawne = 0
+    for i=1:size
+        x = Variable(reshape(x_e[:, :, i], 1, 1, 28, 28), name="x") 
+        y = yhot_e[:, i]
+        result = model(x)
+        if result == argmax(y)
+            poprawne += 1
+        end
+    end
+    acc = round(100 * poprawne/suma; digits=2)
+    return acc
+end
+
+#@show loss_and_accuracy(net, test_data);  # accuracy about 10%, before training
+
+
+@time for epoch=1:1
+    batchsize = settings.batchsize
+    batch_counter = 0
+    for i=1:600
+        batch_counter += 1
+        x = Variable(reshape(x1[:, :, i], 1, 1, 28, 28), name="x")
+        y1 = Variable(yhot[:, i], name="y")
+        graph = create_graph(net, x)
+        full = agrad(logit_cross_entropy, graph, y1)
+        forward!(full)
+        update_cache!(net, full, settings.eta)
+        if batch_counter == batchsize
+            update_weights!(net, batchsize)
+            batch_counter = 0
+        end
+    end
+    acc = loss_and_accuracy(net, train_data)
+    test_acc = loss_and_accuracy(net, test_data)
+    @info epoch acc test_acc
 end
