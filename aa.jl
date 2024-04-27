@@ -1,14 +1,14 @@
-using MLDatasets, Flux, Statistics
+# using MLDatasets, Flux, Statistics
 using LinearAlgebra
 using Random
 Random.seed!(1234);
 
-train_data = MLDatasets.MNIST(split=:train)
-test_data  = MLDatasets.MNIST(split=:test)
+# train_data = MLDatasets.MNIST(split=:train)
+# test_data  = MLDatasets.MNIST(split=:test)
 
 
-x1 = train_data.features
-yhot = Flux.onehotbatch(train_data.targets, 0:9)
+# x1 = train_data.features
+# yhot = Flux.onehotbatch(train_data.targets, 0:9)
 
 abstract type GraphNode end
 abstract type Operator <: GraphNode end
@@ -363,7 +363,28 @@ function Network(layers...)
     return Network(layers)
 end
 
-function conv(I, K, b)
+# HWCN -> Heigh, Width, Channels, batch size
+
+
+function conv_n(I, K, b)
+    H, W, C, N = size(I) 
+    HH, WW, C, F = size(K)
+    H_R = 1 + H - HH
+    W_R = 1 + W - WW
+    out = zeros(H_R, W_R, F, N)
+    for n=1:N
+        for depth=1:F
+            for r=1:H_R
+                for c=1:W_R
+                    out[r, c, depth, n] = sum(I[r:r+HH-1, c:c+WW-1, :, n] .* K[:, :, :, depth]) + b[depth]
+                end
+            end
+        end
+    end
+    return out
+end
+
+function conv_o(I, K, b)
     N, C, H, W = size(I)
     F, C, HH, WW = size(K)
     H_R = 1 + H - HH
@@ -380,6 +401,32 @@ function conv(I, K, b)
     end
     return out
 end
+
+function create_kernels(n_input, n_output, kernel_width, kernel_height)
+    # Inicjalizacja Xaviera
+    squid = sqrt(6 / (n_input + n_output * (kernel_width * kernel_height)))
+    random_vals = ones(n_output, n_input, kernel_width, kernel_height) * squid
+    return Variable(random_vals)
+end
+
+function create_kernels2(n_input, n_output, kernel_width, kernel_height)
+    # Inicjalizacja Xaviera
+    squid = sqrt(6 / (n_input + n_output * (kernel_width * kernel_height)))
+    random_vals = ones(kernel_height, kernel_width, n_input, n_output) * squid
+    return random_vals
+end
+
+#x = randn(5, 5, 1, 1)
+#test_o = reshape(x1[:, :, 1], 1, 1, 28, 28)
+test_n = [0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.21568628 0.53333336 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.6745098 0.99215686 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.07058824 0.8862745 0.99215686 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.19215687 0.07058824 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.67058825 0.99215686 0.99215686 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.11764706 0.93333334 0.85882354 0.3137255 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.09019608 0.85882354 0.99215686 0.83137256 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.14117648 0.99215686 0.99215686 0.6117647 0.05490196 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.25882354 0.99215686 0.99215686 0.5294118 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.36862746 0.99215686 0.99215686 0.41960785 0.003921569 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.09411765 0.8352941 0.99215686 0.99215686 0.5176471 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.6039216 0.99215686 0.99215686 0.99215686 0.6039216 0.54509807 0.043137256 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.44705883 0.99215686 0.99215686 0.95686275 0.0627451 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.011764706 0.6666667 0.99215686 0.99215686 0.99215686 0.99215686 0.99215686 0.74509805 0.13725491 0.0 0.0 0.0 0.0 0.0 0.15294118 0.8666667 0.99215686 0.99215686 0.52156866 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.07058824 0.99215686 0.99215686 0.99215686 0.8039216 0.3529412 0.74509805 0.99215686 0.94509804 0.31764707 0.0 0.0 0.0 0.0 0.5803922 0.99215686 0.99215686 0.7647059 0.043137256 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.07058824 0.99215686 0.99215686 0.7764706 0.043137256 0.0 0.007843138 0.27450982 0.88235295 0.9411765 0.1764706 0.0 0.0 0.18039216 0.8980392 0.99215686 0.99215686 0.3137255 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.07058824 0.99215686 0.99215686 0.7137255 0.0 0.0 0.0 0.0 0.627451 0.99215686 0.7294118 0.0627451 0.0 0.50980395 0.99215686 0.99215686 0.7764706 0.03529412 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.49411765 0.99215686 0.99215686 0.96862745 0.16862746 0.0 0.0 0.0 0.42352942 0.99215686 0.99215686 0.3647059 0.0 0.7176471 0.99215686 0.99215686 0.31764707 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.53333336 0.99215686 0.9843137 0.94509804 0.6039216 0.0 0.0 0.0 0.003921569 0.46666667 0.99215686 0.9882353 0.9764706 0.99215686 0.99215686 0.7882353 0.007843138 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.6862745 0.88235295 0.3647059 0.0 0.0 0.0 0.0 0.0 0.0 0.09803922 0.5882353 0.99215686 0.99215686 0.99215686 0.98039216 0.30588236 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.101960786 0.6745098 0.32156864 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.105882354 0.73333335 0.9764706 0.8117647 0.7137255 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.6509804 0.99215686 0.32156864 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.2509804 0.007843138 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 1.0 0.9490196 0.21960784 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.96862745 0.7647059 0.15294118 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.49803922 0.2509804 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0;;;;]
+test_o = reshape(test_n, 1, 1, 28, 28)
+test_k = create_kernels2(1, 6, 3, 3)
+test_k1 = create_kernels(1, 6, 3, 3).output # 2.5269480020289716
+#println( maximum(test_k1) == maximum(test_k)) # true
+test_b = ones(6)
+using BenchmarkTools
+@benchmark conv_n(test_n, test_k, test_b) # 4.957135629854453
+@benchmark conv_o(test_o, test_k1, test_b)
 
 conv(x::GraphNode, w::GraphNode, b::GraphNode) = BroadcastedOperator(conv, x, w, b)
 forward(::BroadcastedOperator{typeof(conv)}, x, w, b) = conv(x, w, b)
@@ -408,12 +455,6 @@ backward(::BroadcastedOperator{typeof(conv)}, x, w, b, g) = let
     return tuple(dx, dw, db)
 end
 
-function create_kernels(n_input, n_output, kernel_width, kernel_height)
-    # Inicjalizacja Xaviera
-    squid = sqrt(6 / (n_input + n_output * (kernel_width * kernel_height)))
-    random_vals = randn(n_output, n_input, kernel_width, kernel_height) * squid
-    return Variable(random_vals)
-end
 
 function xavier_init(n_input, n_output)
     return Variable(randn(n_input, n_output) * sqrt(6 / (n_input + n_output)))
@@ -558,7 +599,7 @@ end
     batch_counter = 0
     for i=1:600
         batch_counter += 1
-        x = Variable(reshape(x1[:, :, i], 1, 1, 28, 28), name="x")
+        x = Variable(reshape(x1[:, :, i], 28, 28, 1, 1), name="x")
         y1 = Variable(yhot[:, i], name="y")
         graph = create_graph(net, x)
         full = agrad(logit_cross_entropy, graph, y1)
