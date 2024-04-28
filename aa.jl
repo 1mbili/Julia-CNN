@@ -51,7 +51,7 @@ show(io::IO, x::Variable) = begin
 end
 function visit(node::GraphNode, visited, order)
     if node ∈ visited
-    else
+    else 
         push!(visited, node)
         push!(order, node)
     end
@@ -245,20 +245,21 @@ forward(::BroadcastedOperator{typeof(reshape)}, x, ndims) = reshape(x, ndims)
 backward(::BroadcastedOperator{typeof(reshape)}, x, ndims, g) =
     tuple(reshape(g, size(x)))
 
-# poprawne = 0
-# suma = 0
+poprawne = 0
+suma = 0
 logit_cross_entropy(y_predicted::GraphNode, y::GraphNode) = BroadcastedOperator(logit_cross_entropy, y_predicted, y)
 forward(::BroadcastedOperator{typeof(logit_cross_entropy)}, y_predicted, y) =
 let
-    # global suma += 1
-    # if argmax(y_predicted) == argmax(y)
-    #     global poprawne += 1
-    # end
-    #println("Accuracy: ", poprawne/suma)
+    global suma += 1
+    println(argmax(y_predicted), argmax(y))
+    if argmax(y_predicted) == argmax(y)
+        global poprawne += 1
+    end
+    println("Accuracy: ", poprawne/suma)
     y_shifted = y_predicted .- maximum(y_predicted)
     shifted_logsumexp = log.(sum(exp.(y_shifted)))
     result = y_shifted .- shifted_logsumexp
-    loss = -1 .* sum(y .* result)
+    loss = -1 .* sum(y .* result, dims=1)
     return loss
 end
 backward(::BroadcastedOperator{typeof(logit_cross_entropy)}, y_predicted, y, g) =
@@ -269,17 +270,23 @@ let
     return tuple(g .* result)
 end
 
-function dense(w, b, x, activation) 
+function dense(w, b, x, activation)
     return activation((w * x) .+ b) 
 end
-function dense(w, x, activation) return activation(w * x) end
+# dense(w::GraphNode, b::GraphNode, x::GraphNode, activation) = BroadcastedOperator(dense, w, b, x, activation)
+# forward(::BroadcastedOperator{typeof(dense)}, w, b, x, activation) = let
+#     activation((w * x) .+ b)
+# end
+# backward(::BroadcastedOperator{typeof(dense)}, x, w, b, g) = let
+#     tuple(w' * g, g * x', g)
+# end
 
 
 function flatten(x) return reshape(x, length(x)) end
 flatten(x::GraphNode) = BroadcastedOperator(flatten, x)
 forward(::BroadcastedOperator{typeof(flatten)}, x) = let
-    println(size(x))
-    reshape(x, 2, 400)
+    h,w,c,n = size(x) # h*w*c, n
+    reshape(x, length(x))
 end
 backward(::BroadcastedOperator{typeof(flatten)}, x, g) = let
     tuple(reshape(g, size(x)))
@@ -328,7 +335,6 @@ end
 
 
 function conv(I, K, b)
-    println(size(I))
     H, W, C, N = size(I)
     HH, WW, C, F = size(K)
     H_R = 1 + H - HH
@@ -343,7 +349,6 @@ function conv(I, K, b)
             end
         end
     end
-    println(size(out))
     return out
 end
 
@@ -541,8 +546,8 @@ end
     batch_counter = 0
     for i=1:2:600
         batch_counter += 1
-        x_val = Variable(x1[:, :, :, i:i+1], name="x")
-        y1 = Variable(yhot[:, i], name="y")
+        x_val = Variable(x1[:, :, :, i:i], name="x")
+        y1 = Variable(yhot[:, i:i], name="y")
         graph = create_graph(net, x_val)
         full = agrad(logit_cross_entropy, graph, y1)
         forward!(full)
@@ -555,4 +560,5 @@ end
     acc = loss_and_accuracy(net, train_data)
     test_acc = loss_and_accuracy(net, test_data)
     @info epoch acc test_acc
+end
 end
