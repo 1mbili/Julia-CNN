@@ -251,7 +251,6 @@ logit_cross_entropy(y_predicted::GraphNode, y::GraphNode) = BroadcastedOperator(
 forward(::BroadcastedOperator{typeof(logit_cross_entropy)}, y_predicted, y) =
 let
     global suma += 1
-    println(argmax(y_predicted), argmax(y))
     if argmax(y_predicted) == argmax(y)
         global poprawne += 1
     end
@@ -292,10 +291,10 @@ backward(::BroadcastedOperator{typeof(flatten)}, x, g) = let
     tuple(reshape(g, size(x)))
 end
 
-function maxPool(x, kernel_size, cache)
+function maxPool(x, kernel_size, pool_cache)
     h, w, c, n = size(x)
     output = zeros(h ÷ 2, w ÷ 2, c, n)
-    empty!(cache)
+    empty!(pool_cache)
     for n=1:n
         for i = 1:c
             for j = 1:h÷2
@@ -304,7 +303,7 @@ function maxPool(x, kernel_size, cache)
                     output[j, k, i, n] = val
 
                     idx, idy = ids[1] + 2 * j - 1 - 1, ids[2] + 2 * k - 1 - 1
-                    push!(cache, CartesianIndex(idx, idy, i, n))
+                    push!(pool_cache, CartesianIndex(idx, idy, i, n))
                 end
             end
         end
@@ -312,15 +311,15 @@ function maxPool(x, kernel_size, cache)
     return output
 end
 
-function maxPoolB(x, g, kernel_size, cache)
+function maxPoolB(x, g, kernel_size, pool_cache)
         output = zeros(size(x))
-        output[cache] = vcat(g...)
+        output[pool_cache] = vcat(g...)
         tuple(output)
     end
 
-maxPool(x::GraphNode, kernel_size:: Any, cache ::Any) = BroadcastedOperator(maxPool, x, kernel_size, cache)
-forward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size, cache ::Any) = maxPool(x, kernel_size, cache)
-backward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size ::Any, cache, g) = maxPoolB(x, g, kernel_size, cache)
+maxPool(x::GraphNode, kernel_size:: Any, pool_cache ::Any) = BroadcastedOperator(maxPool, x, kernel_size, pool_cache)
+forward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size, pool_cache ::Any) = maxPool(x, kernel_size, pool_cache)
+backward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size ::Any, pool_cache, g) = maxPoolB(x, g, kernel_size, pool_cache)
 
 abstract type NetworkLayer end
 
@@ -478,7 +477,6 @@ create_graph(n::Network, x) = begin
             x = layer.func(x, layer.weights, layer.bias)
             x = layer.activation(x)
         elseif layer.func == maxPool
-            #layer.cache.output .= Constant(CartesianIndex{4}[])
             x = layer.func(x, layer.kernel_size, layer.cache)
         else
             x = layer.func(x)
@@ -517,7 +515,7 @@ end
 settings = (;
     eta = 1e-2,
     epochs = 3,
-    batchsize = 100,
+    batchsize = 2,
 )
 
 function loss_and_accuracy(model, data)
@@ -544,10 +542,10 @@ end
 @time for epoch=1:1
     batchsize = settings.batchsize
     batch_counter = 0
-    for i=1:2:600
+    for i=1:800
         batch_counter += 1
         x_val = Variable(x1[:, :, :, i:i], name="x")
-        y1 = Variable(yhot[:, i:i], name="y")
+        y1 = Variable(yhot[:, i], name="y")
         graph = create_graph(net, x_val)
         full = agrad(logit_cross_entropy, graph, y1)
         forward!(full)
@@ -560,5 +558,4 @@ end
     acc = loss_and_accuracy(net, train_data)
     test_acc = loss_and_accuracy(net, test_data)
     @info epoch acc test_acc
-end
 end
