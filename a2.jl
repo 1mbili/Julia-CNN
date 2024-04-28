@@ -1,13 +1,14 @@
 using MLDatasets, Flux, Statistics
 using LinearAlgebra
 using Random
-Random.seed!(1234);
+Random.seed!(1234); #Żeby łatwiej testować
 
 train_data = MLDatasets.MNIST(split=:train)
 test_data  = MLDatasets.MNIST(split=:test)
 
 
-x1 = reshape(train_data.features, 28, 28, 1, :)
+dim1, dim2, dim3 = size(train_data.features)
+x1 = train_data.features
 yhot = Flux.onehotbatch(train_data.targets, 0:9)
 
 abstract type GraphNode end
@@ -220,10 +221,26 @@ backward(node::BroadcastedOperator{typeof(log)}, x, g) = let
 end
 
 
+Base.Broadcast.broadcasted(sin, x::GraphNode) = BroadcastedOperator(sin, x)
+forward(::BroadcastedOperator{typeof(sin)}, x) = return cos.(x)
+backward(::BroadcastedOperator{typeof(sin)}, x, g) = let
+    J = diagm(cos.(x))
+    tuple(J' * g)
+end
+
 Base.Broadcast.broadcasted(exp, x::GraphNode) = BroadcastedOperator(exp, x)
 forward(::BroadcastedOperator{typeof(exp)}, x) = return exp.(x)
 backward(::BroadcastedOperator{typeof(exp)}, x, g) = let
     J = diagm(exp.(x))
+    tuple(J' * g)
+end
+
+
+σ(x::Real) = one(x) / (one(x) + exp(-x))
+σ(x::GraphNode) = BroadcastedOperator(σ, x)
+forward(::BroadcastedOperator{typeof(σ)}, x) = return 1.0 ./ (1.0 .+ exp.(-x))
+backward(::BroadcastedOperator{typeof(σ)}, x, g) = let
+    J = diagm(1.0 ./ (1.0 .+ exp.(-x))).*(1.0 .- (1.0 ./ (1.0 .+ exp.(-x))))
     tuple(J' * g)
 end
 
@@ -232,11 +249,20 @@ relu(x::GraphNode) = BroadcastedOperator(relu, x)
 forward(::BroadcastedOperator{typeof(relu)}, x) = return max.(zero(x), x)
 backward(::BroadcastedOperator{typeof(relu)}, x, g) = tuple(g .* (x .> 0))
 
+
 import Base: identity
 identity(x::GraphNode) = BroadcastedOperator(identity, x)
 forward(::BroadcastedOperator{typeof(identity)}, x) = return x
 backward(node::BroadcastedOperator{typeof(identity)}, x, g) = let
     tuple(g)
+end
+
+Base.Broadcast.broadcasted(^, x::GraphNode, y::GraphNode) = BroadcastedOperator(^, x, y)
+forward(::BroadcastedOperator{typeof(^)}, x, y) = return x .^ y
+backward(node::BroadcastedOperator{typeof(^)}, x, y, g) = let
+    Jx = diagm(y .* x .^ (y .- 1.0))
+    Jy = diagm(log.(abs.(x)) .* x .^ y)
+    tuple(Jx' * g, Jy' * g)
 end
 
 import Base.reshape
@@ -245,16 +271,11 @@ forward(::BroadcastedOperator{typeof(reshape)}, x, ndims) = reshape(x, ndims)
 backward(::BroadcastedOperator{typeof(reshape)}, x, ndims, g) =
     tuple(reshape(g, size(x)))
 
-# poprawne = 0
-# suma = 0
+
+
 logit_cross_entropy(y_predicted::GraphNode, y::GraphNode) = BroadcastedOperator(logit_cross_entropy, y_predicted, y)
 forward(::BroadcastedOperator{typeof(logit_cross_entropy)}, y_predicted, y) =
 let
-    # global suma += 1
-    # if argmax(y_predicted) == argmax(y)
-    #     global poprawne += 1
-    # end
-    #println("Accuracy: ", poprawne/suma)
     y_shifted = y_predicted .- maximum(y_predicted)
     shifted_logsumexp = log.(sum(exp.(y_shifted)))
     result = y_shifted .- shifted_logsumexp
@@ -277,112 +298,89 @@ function dense(w, x, activation) return activation(w * x) end
 
 function flatten(x) return reshape(x, length(x)) end
 flatten(x::GraphNode) = BroadcastedOperator(flatten, x)
-forward(::BroadcastedOperator{typeof(flatten)}, x) = let
-    println(size(x))
-    reshape(x, 2, 400)
-end
-backward(::BroadcastedOperator{typeof(flatten)}, x, g) = let
-    tuple(reshape(g, size(x)))
-end
+forward(::BroadcastedOperator{typeof(flatten)}, x) = reshape(x, length(x))
+backward(::BroadcastedOperator{typeof(flatten)}, x, g) = tuple(reshape(g, size(x)))
 
-function maxPool(x, kernel_size, cache)
-    h, w, c, n = size(x)
-    output = zeros(h ÷ 2, w ÷ 2, c, n)
-    empty!(cache)
-    for n=1:n
-        for i = 1:c
-            for j = 1:h÷2
-                @views for k = 1:w÷2
-                    val, ids = findmax( x[2*j-1:2*j, 2*k-1:2*k, i, :])
-                    output[j, k, i, n] = val
-
-                    idx, idy = ids[1] + 2 * j - 1 - 1, ids[2] + 2 * k - 1 - 1
-                    push!(cache, CartesianIndex(idx, idy, i, n))
-                end
-            end
-        end
+function maxPool(x, kernel_size)
+    println(x[1, 1, :, :])
+    aga
+    N, C, H, W = size(x)
+    K_H = kernel_size[1]
+    K_W = kernel_size[2]
+    W_2 = fld(W - K_W, K_W) + 1
+    H_2 = fld(H - K_H ,K_H) + 1
+    if H_2 % 2 == 1
+        H -= 1
+        W -= 1
     end
-    return output
-end
-
-function maxPoolB(x, g, kernel_size, cache)
-        output = zeros(size(x))
-        output[cache] = vcat(g...)
-        tuple(output)
-    end
-
-maxPool(x::GraphNode, kernel_size:: Any, cache ::Any) = BroadcastedOperator(maxPool, x, kernel_size, cache)
-forward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size, cache ::Any) = maxPool(x, kernel_size, cache)
-backward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size ::Any, cache, g) = maxPoolB(x, g, kernel_size, cache)
-
-abstract type NetworkLayer end
-
-
-mutable struct Network
-    layers
-end
-
-function Network(layers...)
-    return Network(layers)
-end
-
-
-function conv(I, K, b)
-    println(size(I))
-    H, W, C, N = size(I)
-    HH, WW, C, F = size(K)
-    H_R = 1 + H - HH
-    W_R = 1 + W - WW
-    out = zeros(H_R, W_R, F, N)
+    out = zeros(N, C, H_2, W_2)
     for n=1:N
-        for depth=1:F
-            for r=1:H_R
-                @views for c=1:W_R
-                    out[r, c, depth, n] = sum(I[r:r+HH-1, c:c+WW-1, :, n] .* K[:, :, :, depth]) + b[depth]
+        for c=1:C
+            for h=1:K_H:H
+                for w=1:K_W:W
+                    out[n, c, Int.((w+1)/K_W), Int.((h+1)/K_H)] = maximum(x[n, c, h:h+K_H-1,w:w+K_W-1])
                 end
             end
         end
     end
-    println(size(out))
     return out
 end
 
 
-# function create_kernels(n_input, n_output, kernel_width, kernel_height)
-#     # Inicjalizacja Xaviera
-#     squid = sqrt(6 / (n_input + n_output * (kernel_width * kernel_height)))
-#     random_vals = ones(n_output, n_input, kernel_width, kernel_height) * squid
-#     return Variable(random_vals)
-# end
-
-function create_kernels(n_input, n_output, kernel_width, kernel_height)
-    # Inicjalizacja Xaviera
-    squid = sqrt(6 / (n_input + n_output * (kernel_width * kernel_height)))
-    random_vals = randn(kernel_height, kernel_width, n_input, n_output) * squid
-    return Variable(random_vals)
+function maxPoolB(x, g, kernel_size)
+    println(g[1, 1, :, :])
+    N, C, H, W = size(x)
+    Gn, Gc, Gh, Gw = size(g)
+    dx = zeros(N, C, H, W)
+    K_H = kernel_size[1]
+    K_W = kernel_size[2]
+    for n=1:Gn
+        for c=1:Gc
+            for h=1:Gh
+                for w=1:Gw
+                    max_val = x[n, c, 1+(h-1)*K_H:h*(K_H), 1+(w-1)*K_W:w*K_W]
+                    max_h, max_w = Tuple.(findmax(max_val)[2])
+                    max_h += (h-1)*K_H
+                    max_w += (w-1)*K_W
+                    dx[n,c,max_h,max_w] = g[n,c,h,w]
+                end
+            end
+        end
+    end
+    return tuple(dx)
 end
-# #x = randn(5, 5, 1, 1)
-# #test_o = reshape(x1[:, :, 1], 1, 1, 28, 28)
-# test_n = [0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.21568628 0.53333336 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.6745098 0.99215686 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.07058824 0.8862745 0.99215686 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.19215687 0.07058824 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.67058825 0.99215686 0.99215686 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.11764706 0.93333334 0.85882354 0.3137255 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.09019608 0.85882354 0.99215686 0.83137256 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.14117648 0.99215686 0.99215686 0.6117647 0.05490196 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.25882354 0.99215686 0.99215686 0.5294118 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.36862746 0.99215686 0.99215686 0.41960785 0.003921569 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.09411765 0.8352941 0.99215686 0.99215686 0.5176471 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.6039216 0.99215686 0.99215686 0.99215686 0.6039216 0.54509807 0.043137256 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.44705883 0.99215686 0.99215686 0.95686275 0.0627451 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.011764706 0.6666667 0.99215686 0.99215686 0.99215686 0.99215686 0.99215686 0.74509805 0.13725491 0.0 0.0 0.0 0.0 0.0 0.15294118 0.8666667 0.99215686 0.99215686 0.52156866 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.07058824 0.99215686 0.99215686 0.99215686 0.8039216 0.3529412 0.74509805 0.99215686 0.94509804 0.31764707 0.0 0.0 0.0 0.0 0.5803922 0.99215686 0.99215686 0.7647059 0.043137256 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.07058824 0.99215686 0.99215686 0.7764706 0.043137256 0.0 0.007843138 0.27450982 0.88235295 0.9411765 0.1764706 0.0 0.0 0.18039216 0.8980392 0.99215686 0.99215686 0.3137255 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.07058824 0.99215686 0.99215686 0.7137255 0.0 0.0 0.0 0.0 0.627451 0.99215686 0.7294118 0.0627451 0.0 0.50980395 0.99215686 0.99215686 0.7764706 0.03529412 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.49411765 0.99215686 0.99215686 0.96862745 0.16862746 0.0 0.0 0.0 0.42352942 0.99215686 0.99215686 0.3647059 0.0 0.7176471 0.99215686 0.99215686 0.31764707 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.53333336 0.99215686 0.9843137 0.94509804 0.6039216 0.0 0.0 0.0 0.003921569 0.46666667 0.99215686 0.9882353 0.9764706 0.99215686 0.99215686 0.7882353 0.007843138 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.6862745 0.88235295 0.3647059 0.0 0.0 0.0 0.0 0.0 0.0 0.09803922 0.5882353 0.99215686 0.99215686 0.99215686 0.98039216 0.30588236 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.101960786 0.6745098 0.32156864 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.105882354 0.73333335 0.9764706 0.8117647 0.7137255 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.6509804 0.99215686 0.32156864 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.2509804 0.007843138 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 1.0 0.9490196 0.21960784 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.96862745 0.7647059 0.15294118 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.49803922 0.2509804 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0;;;;]
-# # test_o = reshape(test_n, 1, 1, 28, 28)
-# # test_k = create_kernels2(1, 6, 3, 3)
-# test_k = create_kernels(1, 6, 3, 3).output # 2.5269480020289716
-# # #println( maximum(test_k1) == maximum(test_k)) # true
-# test_b = zeros(6)
-# # # using BenchmarkTools
-# # println(maximum(conv2(test_n, test_k, test_b))) # 4.957135629854453
-# # println(maximum(conv(test_n, test_k)))
-# # println(maximum(conv_o(test_o, test_k1, test_b)))
+
+maxPool(x::GraphNode, kernel_size:: Any) = BroadcastedOperator(maxPool, x, kernel_size)
+forward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size) = maxPool(x, kernel_size)
+backward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size, g) = maxPoolB(x, g, kernel_size)
+
+
+function conv(I, K, b)
+    N, C, H, W = size(I)
+    F, C, HH, WW = size(K)
+    H_R = 1 + H - HH
+    W_R = 1 + W - WW
+    out = zeros(N, F, H_R, W_R)
+    for n=1:N
+        for depth=1:F
+            for r=1:H_R
+                for c=1:W_R
+                    out[n, depth, r, c] = sum(I[n,:, r:r+HH-1, c:c+WW-1] .* K[depth, :, :, :]) + b[depth]
+                end
+            end
+        end
+    end
+    println(out[1, 1, :, :])
+    dupa
+    return out
+end
 
 conv(x::GraphNode, w::GraphNode, b::GraphNode) = BroadcastedOperator(conv, x, w, b)
 forward(::BroadcastedOperator{typeof(conv)}, x, w, b) = conv(x, w, b)
 backward(::BroadcastedOperator{typeof(conv)}, x, w, b, g) = let 
-    #N, F, H_R, W_R = size(g)
-    H_R, W_R, F, N = size(g)
-    #N, C, H, W = size(x)
-    H, W, C, N = size(x)
-    #F, C, HH, WW = size(w)
-    HH, WW, C, F = size(w)
+    N, F, H_R, W_R = size(g)
+    N, C, H, W = size(x)
+    F, C, HH, WW = size(w)
     dx = zeros(size(x))
     dw = zeros(size(w))
     db = zeros(size(b))
@@ -390,23 +388,38 @@ backward(::BroadcastedOperator{typeof(conv)}, x, w, b, g) = let
         for depth=1:F
             for r=1:H_R
                 for c=1:W_R
-                    wu = w[:, :, :, depth]
-                    gje = g[r, c, depth, n]
-                    dx[r:r+HH-1, c:c+WW-1, :, n] += wu .* gje
-                    dw[:, :, :, depth] += x[r:r+HH-1, c:c+WW-1, :, n] .* g[r, c, depth, n]
+                    wu = w[depth, :, :, :]
+                    gje = g[n, depth, r, c]
+                    dx[n, :, r:r+HH-1, c:c+WW-1] += wu .* gje
+                    dw[depth, :, :, :] += x[n, :, r:r+HH-1, c:c+WW-1] .* g[n, depth, r, c]
                 end
             end
         end
     end
     for depth=1:F
-        db[depth] = sum(g[:, :, depth, :])
+        db[depth] = sum(g[:, depth, :, :])
     end
     return tuple(dx, dw, db)
 end
 
+function create_kernels(n_input, n_output, kernel_width, kernel_height)
+    # Inicjalizacja Xaviera
+    squid = sqrt(6 / (n_input + n_output * (kernel_width * kernel_height)))
+    random_vals = randn(n_output, n_input, kernel_width, kernel_height) * squid
+    return Variable(random_vals)
+end
 
 function xavier_init(n_input, n_output)
     return Variable(randn(n_input, n_output) * sqrt(6 / (n_input + n_output)))
+end
+
+# Żebym mógł ładnie sieć zdefiniować
+abstract type NetworkLayer end
+mutable struct Network
+    layers
+end
+function Network(layers...)
+    return Network(layers)
 end
 
 
@@ -420,9 +433,8 @@ end
 
 mutable struct aMaxPool <: NetworkLayer
     kernel_size :: Any
-    cache :: Constant{Vector{CartesianIndex{4}}}
     func :: Function
-    aMaxPool(kernel_size) = new(Constant(kernel_size), Constant(CartesianIndex{4}[]), maxPool)
+    aMaxPool(kernel_size) = new(Constant(kernel_size), maxPool)
 end
 
 mutable struct aFlatten <: NetworkLayer
@@ -457,12 +469,12 @@ net = Network(
             x = layer.func(x, layer.weights, layer.bias)
             x = layer.activation(x)
         elseif layer.func == maxPool
-            x = layer.func(x, layer.kernel_size, layer.cache)
+             x = layer.func(x, layer.kernel_size)
         else
             x = layer.func(x)
         end
     end
-    return argmax(forward!(topological_sort(x)))
+    return argmax(forward!(topological_sort(x)))-1
 end
 
 create_graph(n::Network, x) = begin
@@ -473,8 +485,7 @@ create_graph(n::Network, x) = begin
             x = layer.func(x, layer.weights, layer.bias)
             x = layer.activation(x)
         elseif layer.func == maxPool
-            #layer.cache.output .= Constant(CartesianIndex{4}[])
-            x = layer.func(x, layer.kernel_size, layer.cache)
+             x = layer.func(x, layer.kernel_size)
         else
             x = layer.func(x)
         end
@@ -488,23 +499,31 @@ agrad(loss_func, y_predicted, y_true) = begin
     return order
 end
 
-function update_weights!(n::Network, batchsize, learning_rate)
+function update_weights!(n::Network, batchsize)
     for layer in n.layers
-        if layer.func == dense || layer.func == conv
-            layer.weights.output .-= learning_rate * layer.weights.cache / batchsize
-            layer.bias.output .-= learning_rate * layer.bias.cache / batchsize
+        if layer.func == dense
+            layer.weights.output .-= layer.weights.cache / batchsize
+            layer.bias.output .-= layer.bias.cache / batchsize
+            layer.bias.cache .= 0
+            layer.weights.cache .= 0
+        elseif layer.func == conv
+            layer.weights.output .-= layer.weights.cache / batchsize
+            layer.bias.output .-= layer.bias.cache / batchsize
             layer.bias.cache .= 0
             layer.weights.cache .= 0
         end
     end
 end
 
-function update_cache!(n::Network, order)
+function update_cache!(n::Network, order, learning_rate)
     backward!(order)
     for layer in n.layers
-        if layer.func == dense || layer.func == conv
-            layer.weights.cache .+= layer.weights.gradient
-            layer.bias.cache .+= layer.bias.gradient
+        if layer.func == dense
+            layer.weights.cache .+= learning_rate .* layer.weights.gradient
+            layer.bias.cache .+= learning_rate .* layer.bias.gradient
+        elseif layer.func == conv
+            layer.weights.cache .+= learning_rate .* layer.weights.gradient
+            layer.bias.cache .+= learning_rate .* layer.bias.gradient
         end
     end
 end
@@ -516,16 +535,16 @@ settings = (;
 )
 
 function loss_and_accuracy(model, data)
-    x_e = reshape(data.features, 28, 28, 1, :)
+    x_e = data.features
     yhot_e = Flux.onehotbatch(data.targets, 0:9)
-    size = 100
+    size = length(data)
     suma = size
     poprawne = 0
     for i=1:size
-        x = Variable(x_e[:, :, :, i:i], name="x") 
+        x = Variable(reshape(x_e[:, :, i], 1, 1, 28, 28), name="x") 
         y = yhot_e[:, i]
         result = model(x)
-        if result == argmax(y)
+        if result == argmax(y)-1
             poprawne += 1
         end
     end
@@ -533,26 +552,26 @@ function loss_and_accuracy(model, data)
     return acc
 end
 
-#@show loss_and_accuracy(net, test_data);  # accuracy about 10%, before training
+
 
 
 @time for epoch=1:1
     batchsize = settings.batchsize
     batch_counter = 0
-    for i=1:2:600
+    for i=1:size(train_data.features)[3]
         batch_counter += 1
-        x_val = Variable(x1[:, :, :, i:i+1], name="x")
+        x = Variable(reshape(x1[:, :, i], 1, 1, 28, 28), name="x")
         y1 = Variable(yhot[:, i], name="y")
-        graph = create_graph(net, x_val)
+        graph = create_graph(net, x)
         full = agrad(logit_cross_entropy, graph, y1)
         forward!(full)
-        update_cache!(net, full)
+        update_cache!(net, full, settings.eta)
         if batch_counter == batchsize
-            update_weights!(net, batchsize, settings.eta)
+            update_weights!(net, batchsize)
             batch_counter = 0
         end
     end
     acc = loss_and_accuracy(net, train_data)
     test_acc = loss_and_accuracy(net, test_data)
     @info epoch acc test_acc
-end
+end  
