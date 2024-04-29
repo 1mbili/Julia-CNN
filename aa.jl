@@ -295,15 +295,15 @@ function maxPool(x, kernel_size, pool_cache)
     h, w, c, n = size(x)
     output = zeros(h ÷ 2, w ÷ 2, c, n)
     empty!(pool_cache)
-    for n=1:n
+    for m=1:n
         for i = 1:c
             for j = 1:h÷2
                 @views for k = 1:w÷2
                     val, ids = findmax( x[2*j-1:2*j, 2*k-1:2*k, i, :])
-                    output[j, k, i, n] = val
+                    output[j, k, i, m] = val
 
                     idx, idy = ids[1] + 2 * j - 1 - 1, ids[2] + 2 * k - 1 - 1
-                    push!(pool_cache, CartesianIndex(idx, idy, i, n))
+                    push!(pool_cache, CartesianIndex(idx, idy, i, m))
                 end
             end
         end
