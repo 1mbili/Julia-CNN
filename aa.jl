@@ -1,4 +1,5 @@
 using MLDatasets, Flux, Statistics
+#using StaticArrays
 using LinearAlgebra
 using Random
 Random.seed!(1234);
@@ -7,7 +8,7 @@ train_data = MLDatasets.MNIST(split=:train)
 test_data  = MLDatasets.MNIST(split=:test)
 
 function loader(data; batchsize::Int=1)
-    x4dim = reshape(data.features, 28, 28, 1, :) # insert trivial channel dim
+    x4dim = convert(Array{Float64, 4}, reshape(data.features, 28, 28, 1, :)) # insert trivial channel dim
     yhot  = Flux.onehotbatch(data.targets, 0:9)  # make a 10×60000 OneHotMatrix
     Flux.DataLoader((x4dim, yhot); batchsize, shuffle=true)
 end
@@ -24,9 +25,8 @@ end
 mutable struct Variable <: GraphNode
     output :: Any
     gradient :: Any
-    cache :: Any
     name :: String
-    Variable(output; name="?") = new(output, nothing, zero(copy(output)), name)
+    Variable(output; name="?") = new(output, nothing, name)
 end
 
 mutable struct ScalarOperator{F} <: Operator
@@ -272,23 +272,17 @@ let
     y_predicted = y_predicted .- maximum(y_predicted)
     y_predicted = exp.(y_predicted) ./ sum(exp.(y_predicted), dims=1)
     result = (y_predicted - y)
-    #println("Result: ", size(result))
     return tuple(g .* result)
 end
 
-# function dense(w, b, x)
-#     return (w * x) .+ b 
-# end
 dense(w::GraphNode, b::GraphNode, x::GraphNode) = BroadcastedOperator(dense, w, b, x)
 forward(::BroadcastedOperator{typeof(dense)}, w, b, x) = let
     (w * x) .+ b
 end
 backward(::BroadcastedOperator{typeof(dense)}, w, b, x, g) = let
-    #println(size(g), size(x), size(w))
     dw = g * x'
     dx = w' * g
     db = sum(g, dims=2)
-    #println(size(dw), size(db), size(dx))
     tuple(dw, db, dx)
 end
 
@@ -303,18 +297,24 @@ backward(::BroadcastedOperator{typeof(flatten)}, x, g) = let
     tuple(reshape(g, size(x)))
 end
 
-function maxPool(x, kernel_size, pool_cache)
+function maxPool(x::Array{Float64, 4}, kernel_size::Tuple{Int64, Int64}, pool_cache::Vector{CartesianIndex{4}})
     h, w, c, n = size(x)
-    output = zeros(h ÷ 2, w ÷ 2, c, n)
+    kernel_h, kernel_w = kernel_size
+    out_h, out_w = div(h, kernel_h), div(w, kernel_w)
+    output = zeros(out_h, out_w, c, n)
     empty!(pool_cache)
-    for m=1:n
-        for i = 1:c
-            for j = 1:h÷2
-                for k = 1:w÷2
-                    val, ids = findmax( x[2*j-1:2*j, 2*k-1:2*k, i, m])
-                    output[j, k, i, m] = val
-
-                    idx, idy = ids[1] + 2 * j - 1 - 1, ids[2] + 2 * k - 1 - 1
+    @fastmath @inbounds for m=1:n
+        @inbounds for i = 1:c
+            for j = 1:out_h
+                j_start = (j - 1) * kernel_h + 1
+                j_end = j * kernel_h
+                @views for k = 1:out_w
+                    k_start = (k - 1) * kernel_w + 1
+                    k_end = k * kernel_w
+                    @inbounds  window = x[j_start:j_end, k_start:k_end, i, m]
+                    val, idx_flat = findmax(window)
+                    @inbounds output[j, k, i, m] = val
+                    @inbounds idx, idy = idx_flat[1] + kernel_h * j - 2, idx_flat[2] + kernel_w * k - 2
                     push!(pool_cache, CartesianIndex(idx, idy, i, m))
                 end
             end
@@ -323,15 +323,17 @@ function maxPool(x, kernel_size, pool_cache)
     return output
 end
 
-function maxPoolB(x, g, kernel_size, pool_cache)
-        output = zeros(size(x))
-        output[pool_cache] = vcat(g...)
-        tuple(output)
+function maxPoolB(x::Array{Float64, 4}, g::Array{Float64, 4}, pool_cache:: Vector{CartesianIndex{4}})
+    output = zeros(Float64, size(x))
+    @fastmath @inbounds @views for (cache, grad) in zip(pool_cache, g)
+        output[cache] = grad
     end
+    tuple(output)
+end
 
-maxPool(x::GraphNode, kernel_size:: Any, pool_cache ::Any) = BroadcastedOperator(maxPool, x, kernel_size, pool_cache)
-forward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size, pool_cache ::Any) = maxPool(x, kernel_size, pool_cache)
-backward(::BroadcastedOperator{typeof(maxPool)}, x, kernel_size ::Any, pool_cache, g) = maxPoolB(x, g, kernel_size, pool_cache)
+maxPool(x::GraphNode, kernel_size:: Constant{Tuple{Int64, Int64}}, pool_cache:: Constant{Vector{CartesianIndex{4}}}) = BroadcastedOperator(maxPool, x, kernel_size, pool_cache)
+forward(::BroadcastedOperator{typeof(maxPool)}, x::Array{Float64, 4}, kernel_size::Tuple{Int64, Int64}, pool_cache::Vector{CartesianIndex{4}}) = maxPool(x, kernel_size, pool_cache)
+backward(::BroadcastedOperator{typeof(maxPool)}, x::Array{Float64, 4}, kernel_size::Tuple{Int64, Int64}, pool_cache::Vector{CartesianIndex{4}}, g) = maxPoolB(x, g, pool_cache)
 
 abstract type NetworkLayer end
 
@@ -343,26 +345,38 @@ function Network(layers...)
     return Network(layers)
 end
 
-function conv(I, K, b)
-    H, W, C, N = size(I)
+function im2col(I, HH, WW)
+    H, W, C = size(I)
+    H_R = 1 + H - HH
+    W_R = 1 + W - WW
+    col = zeros(HH*WW*C, H_R*W_R)
+    for r=1:H_R
+        for c=1:W_R
+            col[:, (r-1)*W_R + c] = reshape(I[r:r+HH-1, c:c+WW-1, :], HH*WW*C)
+        end
+    end
+    return col
+end
+
+
+function conv(I, K)
+    H, W, C, N = size(I) 
     HH, WW, C, F = size(K)
     H_R = 1 + H - HH
     W_R = 1 + W - WW
     out = zeros(H_R, W_R, F, N)
     for n=1:N
-        for depth=1:F
-            for r=1:H_R
-                for c=1:W_R
-                    out[r, c, depth, n] = sum(I[r:r+HH-1, c:c+WW-1, :, n] .* K[:, :, :, depth]) + b[depth]
-                end
-            end
-        end
+        im = I[:, :, :, n]
+        im_col = im2col(im, HH, WW)
+        filter_col = reshape(K, HH*WW*C, F)
+        mul = filter_col' * im_col
+        out[:, :, :, n] = reshape(mul, H_R, W_R, F)
     end
     return out
 end
 
 
-function create_kernels(n_input, n_output, kernel_width, kernel_height)
+function create_kernels(n_input::Int64, n_output::Int64, kernel_width::Int64, kernel_height::Int64)
     # Inicjalizacja Xaviera
     squid = sqrt(6 / (n_input + n_output * (kernel_width * kernel_height)))
     random_vals = randn(kernel_height, kernel_width, n_input, n_output) * squid
@@ -381,7 +395,7 @@ backward(::BroadcastedOperator{typeof(conv)}, x, w, b, g) = let
     for n=1:N
         for depth=1:F
             for r=1:H_R
-                for c=1:W_R
+                @views for c=1:W_R
                     wu = w[:, :, :, depth]
                     gje = g[r, c, depth, n]
                     dx[r:r+HH-1, c:c+WW-1, :, n] += wu * gje
@@ -390,7 +404,7 @@ backward(::BroadcastedOperator{typeof(conv)}, x, w, b, g) = let
             end
         end
     end
-    for depth=1:F
+    @views for depth=1:F
         db[depth] = sum(g[:, :, depth, :])
     end
     return tuple(dx, dw, db)
@@ -458,7 +472,7 @@ net = Network(
     return argmax(forward!(topological_sort(x)))
 end
 
-create_graph(n::Network, x) = begin
+create_graph(n::Network, x::Variable) = begin
     for layer in n.layers
         if layer.func == dense
             x = layer.func(layer.weights, layer.bias, x)
@@ -475,28 +489,18 @@ create_graph(n::Network, x) = begin
     return x
 end
 
-agrad(loss_func, y_predicted, y_true) = begin
+agrad(loss_func::Function, y_predicted::BroadcastedOperator{typeof(identity)}, y_true::Variable) = begin
     loss = loss_func(y_predicted, y_true)
     order = topological_sort(loss)
     return order
 end
 
-function update_weights!(n::Network, batchsize, order, learning_rate)
+function update_weights!(n::Network, batchsize::Integer, order, learning_rate::Float64)
     backward!(order)
     for layer in n.layers
         if layer.func == dense || layer.func == conv
             layer.weights.output .-= learning_rate * layer.weights.gradient / batchsize
             layer.bias.output .-= learning_rate * layer.bias.gradient / batchsize
-        end
-    end
-end
-
-function update_cache!(n::Network, order)
-    backward!(order)
-    for layer in n.layers
-        if layer.func == dense || layer.func == conv
-            layer.weights.cache .+= layer.weights.gradient
-            layer.bias.cache .+= layer.bias.gradient
         end
     end
 end
@@ -508,7 +512,7 @@ settings = (;
 )
 
 function loss_and_accuracy(model, data)
-    x_e = reshape(data.features, 28, 28, 1, :)
+    x_e = convert(Array{Float64, 4}, reshape(data.features, 28, 28, 1, :))
     yhot_e = Flux.onehotbatch(data.targets, 0:9)
     size = 100
     suma = size
@@ -532,27 +536,21 @@ function loss_and_accuracy(model, data)
     return acc
 end
 
-#@show loss_and_accuracy(net, test_data);  # accuracy about 10%, before training
+@show loss_and_accuracy(net, test_data);  # accuracy about 10%, before training
 
 
 @time for epoch=1:1
     batchsize = settings.batchsize
     counter = 0
-    for (x,y) in loader(train_data, batchsize=settings.batchsize)
+    for (x,y) in loader(train_data, batchsize=batchsize)
         x_val = Variable(x, name="x")
         y1 = Variable(y, name="y")
         graph = create_graph(net, x_val)
         full = agrad(logit_cross_entropy, graph, y1)
         forward!(full)
-        # update_cache!(net, full)
-        # if batch_counter == batchsize
-        update_weights!(net, 100, full, 0.01)
-        # batch_counter = 0
+        update_weights!(net, batchsize, full, 0.01)
         counter += 1
         println("Batch: ", counter)
-        if counter == 60
-            break
-        end
     end
     acc = loss_and_accuracy(net, train_data)
     test_acc = loss_and_accuracy(net, test_data)

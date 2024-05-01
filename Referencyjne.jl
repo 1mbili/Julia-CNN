@@ -44,7 +44,7 @@ end
 train_log = []
 settings = (;
     eta = 1e-2,
-    epochs = 3,
+    epochs = 1,
     batchsize = 100,
 )
 
