@@ -2,7 +2,6 @@ using MLDatasets, Flux, Statistics
 #using StaticArrays
 using LinearAlgebra
 using Random
-Random.seed!(1234);
 
 train_data = MLDatasets.MNIST(split=:train)
 test_data  = MLDatasets.MNIST(split=:test)
@@ -239,28 +238,16 @@ backward(::BroadcastedOperator{typeof(relu)}, x, g) = tuple(g .* (x .> 0))
 import Base: identity
 identity(x::GraphNode) = BroadcastedOperator(identity, x)
 forward(::BroadcastedOperator{typeof(identity)}, x) = return x
-backward(node::BroadcastedOperator{typeof(identity)}, x, g) = let
-    tuple(g)
-end
+backward(::BroadcastedOperator{typeof(identity)}, x, g) = return tuple(g)
 
 import Base.reshape
 reshape(x::GraphNode, ndims::GraphNode) = BroadcastedOperator(reshape, x, ndims)
 forward(::BroadcastedOperator{typeof(reshape)}, x, ndims) = reshape(x, ndims)
-backward(::BroadcastedOperator{typeof(reshape)}, x, ndims, g) =
-    tuple(reshape(g, size(x)))
+backward(::BroadcastedOperator{typeof(reshape)}, x, ndims, g) = tuple(reshape(g, size(x)))
 
-# poprawne = 0
-# suma = 0
 logit_cross_entropy(y_predicted::GraphNode, y::GraphNode) = BroadcastedOperator(logit_cross_entropy, y_predicted, y)
 forward(::BroadcastedOperator{typeof(logit_cross_entropy)}, y_predicted, y) =
 let
-    # for (y_pred, y_true) in zip(eachcol(y_predicted), eachcol(y))
-    #     global suma += 1
-    #     if argmax(y_pred) == argmax(y_true)
-    #         global poprawne += 1
-    #     end
-    # end
-    # println("Accuracy: ", poprawne/suma)
     y_shifted = y_predicted .- maximum(y_predicted)
     shifted_logsumexp = log.(sum(exp.(y_shifted)))
     result = y_shifted .- shifted_logsumexp
@@ -301,17 +288,17 @@ function maxPool(x::Array{Float32, 4}, kernel_size::Tuple{Int64, Int64}, pool_ca
     h, w, c, n = size(x)
     kernel_h, kernel_w = kernel_size
     out_h, out_w = div(h, kernel_h), div(w, kernel_w)
-    output = zeros(Float32, out_h, out_w, c, n)
+    output = Array{Float32}(undef, out_h, out_w, c, n)
     empty!(pool_cache)
     @fastmath @inbounds for m=1:n
-        @inbounds for i = 1:c
+        for i = 1:c
             for j = 1:out_h
                 j_start = (j - 1) * kernel_h + 1
                 j_end = j * kernel_h
                 @views for k = 1:out_w
                     k_start = (k - 1) * kernel_w + 1
                     k_end = k * kernel_w
-                    @inbounds  window = x[j_start:j_end, k_start:k_end, i, m]
+                    @inbounds window = x[j_start:j_end, k_start:k_end, i, m]
                     val, idx_flat = findmax(window)
                     @inbounds output[j, k, i, m] = val
                     @inbounds idx, idy = idx_flat[1] + kernel_h * j - 2, idx_flat[2] + kernel_w * k - 2
@@ -345,10 +332,16 @@ function Network(layers...)
     return Network(layers)
 end
 
-function im2col(I::Array{Float32, 4}, KH::Int64, KW::Int64)
-    IH, IW, IC, IN = size(I)
-    OH = IH - KH + 1
-    OW = IW - KW + 1
+function im2col(I::Array{Float32, 4}, KH::Int64, KW::Int64, OH::Int64, OW::Int64)
+    """
+    # Arguments
+    I: input image with shape (IH, IW, IC, IN)
+    KH: kernel height
+    KW: kernel width
+    OH: output height
+    OW: output width
+    """
+    _, _, IC, IN = size(I)
     col = Array{Float32}(undef, KH * KW * IC, OH * OW * IN)
     idx = 1
     for n in 1:IN
@@ -368,9 +361,11 @@ function conv(I::Array{Float32, 4}, K::Array{Float32, 4}, b::Array{Float32, 1})
     IH, IW, IC, IN = size(I)
     H_O = 1 + IH - KH
     W_O = 1 + IW - KW
-    col_I = im2col(I, KH, KW)
-    col_K = transpose(reshape(K, KH * KW * KIC, KOC))
-    conv = col_K * col_I .+ b
+    col_I = im2col(I, KH, KW, H_O, W_O)
+    col_K = transpose(reshape(K, :, KOC))
+    conv = zeros(Float32, KOC, H_O * W_O * IN)
+    mul!(conv, col_K, col_I)
+    conv .+= b
     output = reshape(conv, KOC, H_O, W_O, IN)
     output = permutedims(output, (2, 3, 1, 4))
     return output
@@ -388,59 +383,47 @@ conv(x::GraphNode, w::GraphNode, b::GraphNode) = BroadcastedOperator(conv, x, w,
 forward(::BroadcastedOperator{typeof(conv)}, x::Array{Float32, 4}, w::Array{Float32, 4}, b::Array{Float32, 1}) = conv(x, w, b)
 backward(::BroadcastedOperator{typeof(conv)}, x::Array{Float32, 4}, w::Array{Float32, 4}, b::Array{Float32, 1}, g::Array{Float32, 4}) = let
     H, W, C, N = size(x)
-    HH, WW, _, F = size(w)  # Correctly extract the number of filters and ignore the redundant channel size
+    HH, WW, _, F = size(w)
     H_prime = H - HH + 1
     W_prime = W - WW + 1
-
-    # Initialize gradients
     dx = zeros(Float32, size(x))
     dw = zeros(Float32, size(w))
-    db = zeros(Float32, size(b))
+    db = reshape(sum(g, dims=(1, 2, 4)), F)
 
-    # Iterate over each sample in the batch
     @views for i=1:N
         im = x[:, :, :, i]
         im_col = im2col_back(im, HH, WW)
         grad_i = g[:, :, :, i]
-
-        # Bias
         dbias = transpose(reshape(grad_i, :, F))
-        db += sum(dbias, dims=2) 
-        
         #Wagi
         grad_col = reshape(grad_i, H_prime*W_prime, F)
         dfilter_col = im_col * grad_col
         dw += reshape(dfilter_col, HH, WW, C, F)
         # Input
         dim_col = dbias' * transpose(reshape(w, HH*WW*C, F))
-        dx[:, :, :, i] = col2im(dim_col, H_prime, W_prime, HH, WW, C)
+        col2im!(dx[:, :, :, i],dim_col, H_prime, W_prime, HH, WW, C)
     end
 
     return tuple(dx, dw, db)
 end
 
-# Converts a batch of images into column format for easier multiplication in convolution
-function im2col_back(x::Any, HH::Int64, WW::Int64)
+function im2col_back(x::AbstractArray, HH::Int64, WW::Int64)
     H, W, C = size(x)
     H_prime = H - HH + 1
     W_prime = W - WW + 1
     col = zeros(Float32, HH*WW*C, H_prime*W_prime)
-    @views for i=1:H_prime
+    for i=1:H_prime
         for j=1:W_prime
-            patch = x[i:i+HH-1, j:j+WW-1, :]
-            col[:, (i-1)*W_prime+j] = patch[:]
+            @inbounds patch = @view x[i:i+HH-1, j:j+WW-1, :]
+            @inbounds @views col[:, (i-1)*W_prime+j] = patch[:]
         end
     end
     return col
 end
 
-# Converts column format back to the original image shape
-function col2im(col::Matrix{Float32}, H_prime::Int64, W_prime::Int64, HH::Int64, WW::Int64, C::Int64)
-    H = H_prime + HH - 1
-    W = W_prime + WW - 1
-    dx = zeros(Float32, H, W, C)
+function col2im!(dx::AbstractArray, col::AbstractArray, H_prime::Int64, W_prime::Int64, HH::Int64, WW::Int64, C::Int64)
     for i=1:H_prime*W_prime-1
-        row = col[i, :]
+        row = @view col[i, :]
         h_index = div(i, W_prime) + 1
         w_index = mod(i, W_prime) + 1
         @inbounds dx[h_index:h_index+HH-1, w_index:w_index+WW-1, :] += reshape(row, HH, WW, C)
@@ -464,7 +447,7 @@ mutable struct aDense <: NetworkLayer
 end
 
 struct aMaxPool <: NetworkLayer
-    kernel_size :: Any
+    kernel_size :: Constant{Tuple{Int64, Int64}}
     cache :: Constant{Vector{CartesianIndex{4}}}
     func :: Function
     aMaxPool(kernel_size) = new(Constant(kernel_size), Constant(CartesianIndex{4}[]), maxPool)
@@ -553,7 +536,7 @@ settings = (;
 function loss_and_accuracy(model, data)
     x_e = reshape(data.features, 28, 28, 1, :)
     yhot_e = Flux.onehotbatch(data.targets, 0:9)
-    size = 1000
+    size = 10000
     suma = size
     poprawne = 0
     for i=1:size
@@ -567,16 +550,15 @@ function loss_and_accuracy(model, data)
     acc = round(100 * poprawne/suma; digits=2)
     return acc
 end
-
 @show loss_and_accuracy(net, test_data);  # accuracy about 10%, before training
 
 
+x_val = Variable(1, name="x")
+y1 = Variable(1, name="y")
+graph = create_graph(net, x_val)
+full = agrad(logit_cross_entropy, graph, y1)
 for epoch=1:settings.epochs
     batchsize = settings.batchsize
-    x_val = Variable(1, name="x")
-    y1 = Variable(1, name="y")
-    graph = create_graph(net, x_val)
-    full = agrad(logit_cross_entropy, graph, y1)
     @time for (x,y) in loader(train_data, batchsize=batchsize)
         x_val.output = x
         y1.output = y
