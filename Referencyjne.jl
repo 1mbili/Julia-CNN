@@ -8,13 +8,13 @@ function loader(data; batchsize::Int=1)
     Flux.DataLoader((x4dim, yhot); batchsize, shuffle=true)
 end
 
-net = Chain(
-    Flux.flatten,
-    Dense(784 => 25, relu), 
-    Dense(25 => 10, identity),
-)
+# net = Chain(
+#     Flux.flatten,
+#     Dense(784 => 25, relu), 
+#     Dense(25 => 10, identity),
+# )
      
-Chain(
+net = Chain(
   Conv((3, 3), 1 => 6, relu),           # 60 parameters
   MaxPool((2, 2)),
   Conv((3, 3), 6 => 16, relu),          # 880 parameters
@@ -31,10 +31,8 @@ y1hat = net(x1)
 using Statistics: mean  # standard library
 function loss_and_accuracy(model, data)
     (x,y) = only(loader(data; batchsize=length(data)))
-    println(size(x), size(y))
     ŷ = model(x)
     loss = Flux.logitcrossentropy(ŷ, y)  # did not include softmax in the model
-    println("LOSS: ", loss)
     acc = round(100 * mean(Flux.onecold(ŷ) .== Flux.onecold(y)); digits=2)
     (; loss, acc, split=data.split)  # return a NamedTuple
 end
@@ -44,7 +42,7 @@ end
 train_log = []
 settings = (;
     eta = 1e-2,
-    epochs = 1,
+    epochs = 3,
     batchsize = 100,
 )
 

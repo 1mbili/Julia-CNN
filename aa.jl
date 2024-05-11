@@ -1,5 +1,5 @@
 using MLDatasets, Flux, Statistics
-#using StaticArrays
+using StaticArrays
 using LinearAlgebra
 using Random
 Random.seed!(1234)
@@ -325,18 +325,24 @@ function Network(layers...)
     return Network(layers)
 end
 
-function im2col(I::Array{Float32, 4}, KH::Integer, KW::Integer, OH::Integer, OW::Integer)
-    _, _, IC, IN = size(I)
-    col = Array{Float32}(undef, KH * KW * IC, OH * OW * IN)
-    idx = 1
-    
-    @inbounds for n in 1:IN, j in 1:OH, i in 1:OW
-        @views patch = I[j:j+KH-1, i:i+KW-1, :, n]
-        @inbounds @views col[:, idx] .= reshape(patch, KH * KW * IC)
-        idx += 1
+
+function im2col(I::Array{Float32, 4}, KH::Int64, KW::Int64, OH::Int64, OW::Int64)
+    H, W, C, N = size(I)
+    col = Array{Float32}(undef, OH * OW * N, KW * KH * C)
+    out_array = Array{Float32}(undef, OH * OW, KW * KH)
+    indx = reshape(1:H*W, H,W)[1:H-OH+1,1:W-OW+1]
+    for n=1:N,c=1:C
+        im = @view I[:, :, c, n]
+        @inbounds for (i,value) in enumerate(indx)
+          for j = 0:OW-1
+            @views out_array[(i-1)*OH*OW+j*OH+1:(i-1)OH*OW+(j+1)OH] = im[value+j*H:value+OH-1+j*H]
+          end
+        end
+        #res = im2col2(im, OH, OW, out_array, indx)
+        @views col[(n-1)*OH*OW+1:n*OH*OW, (c-1)*KW*KH+1:c*KW * KH] = out_array
     end
-    return col
-end
+    return col'
+  end
 
 function conv(I::Array{Float32, 4}, K::Array{Float32, 4}, b::Array{Float32, 1})
     KH, KW, _, KOC = size(K)
@@ -344,7 +350,6 @@ function conv(I::Array{Float32, 4}, K::Array{Float32, 4}, b::Array{Float32, 1})
     H_O = 1 + IH - KH
     W_O = 1 + IW - KW
     col_I = im2col(I, KH, KW, H_O, W_O)
-    println(size(col_I))
     col_K = reshape(K, :, KOC)'
     conv = zeros(Float32, KOC, H_O * W_O * IN)
     mul!(conv, col_K, col_I)
