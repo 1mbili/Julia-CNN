@@ -2,7 +2,7 @@ using MLDatasets, Flux, Statistics
 #using StaticArrays
 using LinearAlgebra
 using Random
-
+Random.seed!(1234)
 train_data = MLDatasets.MNIST(split=:train)
 test_data  = MLDatasets.MNIST(split=:test)
 
@@ -11,8 +11,6 @@ function loader(data; batchsize::Int=1)
     yhot  = Flux.onehotbatch(data.targets, 0:9)  # make a 10×60000 OneHotMatrix
     Flux.DataLoader((x4dim, yhot); batchsize, shuffle=true)
 end
-# x1 = reshape(train_data.features, 28, 28, 1, :)
-# yhot = Flux.onehotbatch(train_data.targets, 0:9)
 
 abstract type GraphNode end
 abstract type Operator <: GraphNode end
@@ -103,7 +101,6 @@ end
 function backward!(order::Vector; seed::Float32=Float32(1.0))
     result = last(order)
     result.gradient = seed
-    @assert length(result.output) == 1 "Gradient is defined only for scalar functions"
     for node in reverse(order)
         backward!(node)
     end
@@ -258,7 +255,7 @@ backward(::BroadcastedOperator{typeof(logit_cross_entropy)}, y_predicted, y, g) 
 let
     y_predicted = y_predicted .- maximum(y_predicted)
     y_predicted = exp.(y_predicted) ./ sum(exp.(y_predicted), dims=1)
-    result = (y_predicted - y)
+    result = (y_predicted .- y)
     return tuple(g .* result)
 end
 
@@ -274,7 +271,6 @@ backward(::BroadcastedOperator{typeof(dense)}, w::Array{Float32, 2}, b::Array{Fl
 end
 
 
-function flatten(x) return reshape(x, length(x)) end
 flatten(x::GraphNode) = BroadcastedOperator(flatten, x)
 forward(::BroadcastedOperator{typeof(flatten)}, x) = let
     h, w, c, n = size(x)
@@ -290,21 +286,18 @@ function maxPool(x::Array{Float32, 4}, kernel_size::Tuple{Int64, Int64}, pool_ca
     out_h, out_w = div(h, kernel_h), div(w, kernel_w)
     output = Array{Float32}(undef, out_h, out_w, c, n)
     empty!(pool_cache)
-    @fastmath @inbounds for m=1:n
-        for i = 1:c
-            for j = 1:out_h
-                j_start = (j - 1) * kernel_h + 1
-                j_end = j * kernel_h
-                @views for k = 1:out_w
-                    k_start = (k - 1) * kernel_w + 1
-                    k_end = k * kernel_w
-                    @inbounds window = x[j_start:j_end, k_start:k_end, i, m]
-                    val, idx_flat = findmax(window)
-                    @inbounds output[j, k, i, m] = val
-                    @inbounds idx, idy = idx_flat[1] + kernel_h * j - 2, idx_flat[2] + kernel_w * k - 2
-                    push!(pool_cache, CartesianIndex(idx, idy, i, m))
-                end
-            end
+    @fastmath @inbounds for m=1:n, i = 1:c ,j = 1:out_h
+        j_start = (j - 1) * kernel_h + 1
+        j_end = j * kernel_h
+        mv_h = kernel_h * j - 2
+        @views @inbounds for k = 1:out_w
+            k_start = (k - 1) * kernel_w + 1
+            k_end = k * kernel_w
+            @inbounds window = x[j_start:j_end, k_start:k_end, i, m]
+            val, idx_flat = findmax(window)
+            @inbounds output[j, k, i, m] = val
+            @inbounds idx, idy = idx_flat[1] + mv_h, idx_flat[2] + kernel_w * k - 2
+            push!(pool_cache, CartesianIndex(idx, idy, i, m))
         end
     end
     return output
@@ -312,8 +305,8 @@ end
 
 function maxPoolB(x::Array{Float32, 4}, g::Array{Float32, 4}, pool_cache:: Vector{CartesianIndex{4}})
     output = zeros(Float32, size(x))
-    @fastmath @inbounds @views for (cache, grad) in zip(pool_cache, g)
-        output[cache] = grad
+    @fastmath @inbounds for (cache, grad) in zip(pool_cache, g)
+        @views output[cache] = grad
     end
     tuple(output)
 end
@@ -332,37 +325,27 @@ function Network(layers...)
     return Network(layers)
 end
 
-function im2col(I::Array{Float32, 4}, KH::Int64, KW::Int64, OH::Int64, OW::Int64)
-    """
-    # Arguments
-    I: input image with shape (IH, IW, IC, IN)
-    KH: kernel height
-    KW: kernel width
-    OH: output height
-    OW: output width
-    """
+function im2col(I::Array{Float32, 4}, KH::Integer, KW::Integer, OH::Integer, OW::Integer)
     _, _, IC, IN = size(I)
     col = Array{Float32}(undef, KH * KW * IC, OH * OW * IN)
     idx = 1
-    for n in 1:IN
-        for j in 1:OH
-            for i in 1:OW
-                @inbounds @views patch =  I[j:j+KH-1, i:i+KW-1, :, n]
-                @inbounds col[:, idx] = reshape(patch, KH * KW * IC)
-                idx += 1
-            end
-        end
+    
+    @inbounds for n in 1:IN, j in 1:OH, i in 1:OW
+        @views patch = I[j:j+KH-1, i:i+KW-1, :, n]
+        @inbounds @views col[:, idx] .= reshape(patch, KH * KW * IC)
+        idx += 1
     end
     return col
 end
 
 function conv(I::Array{Float32, 4}, K::Array{Float32, 4}, b::Array{Float32, 1})
-    KH, KW, KIC, KOC = size(K)
-    IH, IW, IC, IN = size(I)
+    KH, KW, _, KOC = size(K)
+    IH, IW, _, IN = size(I)
     H_O = 1 + IH - KH
     W_O = 1 + IW - KW
     col_I = im2col(I, KH, KW, H_O, W_O)
-    col_K = transpose(reshape(K, :, KOC))
+    println(size(col_I))
+    col_K = reshape(K, :, KOC)'
     conv = zeros(Float32, KOC, H_O * W_O * IN)
     mul!(conv, col_K, col_I)
     conv .+= b
@@ -384,49 +367,42 @@ forward(::BroadcastedOperator{typeof(conv)}, x::Array{Float32, 4}, w::Array{Floa
 backward(::BroadcastedOperator{typeof(conv)}, x::Array{Float32, 4}, w::Array{Float32, 4}, b::Array{Float32, 1}, g::Array{Float32, 4}) = let
     H, W, C, N = size(x)
     HH, WW, _, F = size(w)
+    HG, WG, _, _ = size(g)
     H_prime = H - HH + 1
     W_prime = W - WW + 1
-    dx = zeros(Float32, size(x))
-    dw = zeros(Float32, size(w))
+    dx = zeros(Float32, H, W, C, N)
+    dw = zeros(Float32, HH*WW*C, F)
     db = reshape(sum(g, dims=(1, 2, 4)), F)
 
-    @views for i=1:N
-        im = x[:, :, :, i]
-        im_col = im2col_back(im, HH, WW)
-        grad_i = g[:, :, :, i]
-        dbias = transpose(reshape(grad_i, :, F))
-        #Wagi
-        grad_col = reshape(grad_i, H_prime*W_prime, F)
-        dfilter_col = im_col * grad_col
-        dw += reshape(dfilter_col, HH, WW, C, F)
-        # Input
-        dim_col = dbias' * transpose(reshape(w, HH*WW*C, F))
-        col2im!(dx[:, :, :, i],dim_col, H_prime, W_prime, HH, WW, C)
-    end
 
+    @inbounds for i=1:N
+        @views im_col = im2col_back(x[:, :, :, i], HH, WW, H_prime, W_prime, C)
+        @views grad_i = g[:, :, :, i]
+        #Wagi
+        @views grad_col = reshape(grad_i, H_prime*W_prime, F)
+        dw .+= im_col * grad_col
+        # Input
+        @views dim_col = reshape(grad_i, HG*WG, F) * reshape(w, HH*WW*C, F)'
+        @views col2im!(dx[:, :, :, i], dim_col, H_prime, W_prime, HH, WW, C)
+    end
+    dw = reshape(dw, HH, WW, C, F)
     return tuple(dx, dw, db)
 end
 
-function im2col_back(x::AbstractArray, HH::Int64, WW::Int64)
-    H, W, C = size(x)
-    H_prime = H - HH + 1
-    W_prime = W - WW + 1
+function im2col_back(x::AbstractArray, HH::Int64, WW::Int64, H_prime::Int64, W_prime::Int64, C::Int64)
     col = zeros(Float32, HH*WW*C, H_prime*W_prime)
-    for i=1:H_prime
-        for j=1:W_prime
-            @inbounds patch = @view x[i:i+HH-1, j:j+WW-1, :]
-            @inbounds @views col[:, (i-1)*W_prime+j] = patch[:]
-        end
+    @inbounds for i=1:H_prime, j=1:W_prime
+        @inbounds @views col[:, (i-1)*W_prime+j] .= reshape(x[i:i+HH-1, j:j+WW-1, :], HH*WW*C)
     end
     return col
 end
 
 function col2im!(dx::AbstractArray, col::AbstractArray, H_prime::Int64, W_prime::Int64, HH::Int64, WW::Int64, C::Int64)
-    for i=1:H_prime*W_prime-1
+    @inbounds for i=1:H_prime*W_prime-1
         row = @view col[i, :]
         h_index = div(i, W_prime) + 1
         w_index = mod(i, W_prime) + 1
-        @inbounds dx[h_index:h_index+HH-1, w_index:w_index+WW-1, :] += reshape(row, HH, WW, C)
+        @inbounds @views dx[h_index:h_index+HH-1, w_index:w_index+WW-1, :] .+= reshape(row, HH, WW, C)
     end
     return dx
 end
@@ -477,7 +453,7 @@ net = Network(
     aDense(84 => 10, identity)
 )
 
-(n::Network)(x) = begin
+(n::Network)(x::Variable) = begin
     for layer in n.layers
         if layer.func == dense
             x = layer.func(layer.weights, layer.bias, x)
@@ -521,8 +497,8 @@ function update_weights!(n::Network, batchsize::Integer, order, learning_rate::F
     backward!(order)
     for layer in n.layers
         if layer.func == dense || layer.func == conv
-            layer.weights.output .-= learning_rate * layer.weights.gradient / batchsize
-            layer.bias.output .-= learning_rate * layer.bias.gradient / batchsize
+            layer.weights.output .-= learning_rate .* layer.weights.gradient ./ batchsize
+            layer.bias.output .-= learning_rate .* layer.bias.gradient ./ batchsize
         end
     end
 end
@@ -557,8 +533,8 @@ x_val = Variable(1, name="x")
 y1 = Variable(1, name="y")
 graph = create_graph(net, x_val)
 full = agrad(logit_cross_entropy, graph, y1)
+batchsize = settings.batchsize
 for epoch=1:settings.epochs
-    batchsize = settings.batchsize
     @time for (x,y) in loader(train_data, batchsize=batchsize)
         x_val.output = x
         y1.output = y
