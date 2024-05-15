@@ -330,7 +330,7 @@ function im2col(I::Array{Float32, 4}, KH::Int64, KW::Int64, OH::Int64, OW::Int64
     H, W, C, N = size(I)
     col = Array{Float32}(undef, OH * OW * N, KW * KH * C)
     out_array = Array{Float32}(undef, OH * OW, KW * KH)
-    indx = reshape(1:H*W, H,W)[1:H-OH+1,1:W-OW+1]
+    indx = reshape(1:H*W, H,W)[1:KH,1:KW]
     for n=1:N,c=1:C
         im = @view I[:, :, c, n]
         @inbounds for (i,value) in enumerate(indx)
@@ -338,8 +338,7 @@ function im2col(I::Array{Float32, 4}, KH::Int64, KW::Int64, OH::Int64, OW::Int64
             @views out_array[(i-1)*OH*OW+j*OH+1:(i-1)OH*OW+(j+1)OH] = im[value+j*H:value+OH-1+j*H]
           end
         end
-        #res = im2col2(im, OH, OW, out_array, indx)
-        @views col[(n-1)*OH*OW+1:n*OH*OW, (c-1)*KW*KH+1:c*KW * KH] = out_array
+        col[(n-1)*OH*OW+1:n*OH*OW, (c-1)*KW*KH+1:c*KW * KH] = out_array
     end
     return col'
   end
@@ -373,31 +372,30 @@ backward(::BroadcastedOperator{typeof(conv)}, x::Array{Float32, 4}, w::Array{Flo
     H, W, C, N = size(x)
     HH, WW, _, F = size(w)
     HG, WG, _, _ = size(g)
-    H_prime = H - HH + 1
-    W_prime = W - WW + 1
     dx = zeros(Float32, H, W, C, N)
     dw = zeros(Float32, HH*WW*C, F)
     db = reshape(sum(g, dims=(1, 2, 4)), F)
-
+    w_reshaped = reshape(w, HH*WW*C, F)'
 
     @inbounds for i=1:N
-        @views im_col = im2col_back(x[:, :, :, i], HH, WW, H_prime, W_prime, C)
+        @views im_col = im2col_back(x[:, :, :, i], HH, WW, HG, WG, C)
         @views grad_i = g[:, :, :, i]
         #Wagi
-        @views grad_col = reshape(grad_i, H_prime*W_prime, F)
+        @views grad_col = reshape(grad_i, HG*WG, F)
         dw .+= im_col * grad_col
         # Input
-        @views dim_col = reshape(grad_i, HG*WG, F) * reshape(w, HH*WW*C, F)'
-        @views col2im!(dx[:, :, :, i], dim_col, H_prime, W_prime, HH, WW, C)
+        dim_col = grad_col * w_reshaped
+        @views col2im!(dx[:, :, :, i], dim_col, HG, WG, HH, WW, C)
     end
     dw = reshape(dw, HH, WW, C, F)
     return tuple(dx, dw, db)
 end
 
+
 function im2col_back(x::AbstractArray, HH::Int64, WW::Int64, H_prime::Int64, W_prime::Int64, C::Int64)
     col = zeros(Float32, HH*WW*C, H_prime*W_prime)
     @inbounds for i=1:H_prime, j=1:W_prime
-        @inbounds @views col[:, (i-1)*W_prime+j] .= reshape(x[i:i+HH-1, j:j+WW-1, :], HH*WW*C)
+        @inbounds @views col[:, (i-1)*W_prime+j] = reshape(x[i:i+HH-1, j:j+WW-1, :], HH*WW*C)
     end
     return col
 end
@@ -546,7 +544,7 @@ for epoch=1:settings.epochs
         forward!(full)
         update_weights!(net, batchsize, full, Float32(0.01))
     end
-    acc = loss_and_accuracy(net, train_data)
-    test_acc = loss_and_accuracy(net, test_data)
-    @info epoch acc test_acc
+    #acc = loss_and_accuracy(net, train_data)
+    #test_acc = loss_and_accuracy(net, test_data)
+    #@info epoch acc test_acc
 end
